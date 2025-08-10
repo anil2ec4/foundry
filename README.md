@@ -241,6 +241,19 @@ cast block-number
 
 Run `anvil --help` to explore the full list of available features and their usage.
 
+### Troubleshooting: Chained transactions with automine disabled
+
+When **automine is off**, a second transaction that **depends on funds** created by a previous pending transaction may be rejected with:
+
+```
+error: Insufficient funds for gas * price + value
+```
+
+This happens because the second tx is validated **before** the funding tx is mined.  
+**Workarounds:**
+- Temporarily enable automine and mine the funding tx first, or
+- Manually mine a block between the two transactions.
+
 More documentation can be found in the [anvil](https://getfoundry.sh/anvil/overview) section of the Foundry Docs.
 
 ## Chisel
