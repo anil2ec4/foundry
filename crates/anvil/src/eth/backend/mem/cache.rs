@@ -1,5 +1,5 @@
 use crate::config::anvil_tmp_dir;
-use ethers::prelude::H256;
+use alloy_primitives::B256;
 use foundry_evm::backend::StateSnapshot;
 use std::{
     io,
@@ -18,8 +18,12 @@ pub struct DiskStateCache {
 }
 
 impl DiskStateCache {
+    /// Specify the path where to create the tempdir in
+    pub fn with_path(self, temp_path: PathBuf) -> Self {
+        Self { temp_path: Some(temp_path), temp_dir: None }
+    }
     /// Returns the cache file for the given hash
-    fn with_cache_file<F, R>(&mut self, hash: H256, f: F) -> Option<R>
+    fn with_cache_file<F, R>(&mut self, hash: B256, f: F) -> Option<R>
     where
         F: FnOnce(PathBuf) -> R,
     {
@@ -43,7 +47,7 @@ impl DiskStateCache {
                 }
             }
         }
-        if let Some(ref temp_dir) = self.temp_dir {
+        if let Some(temp_dir) = &self.temp_dir {
             let path = temp_dir.path().join(format!("{hash:?}.json"));
             Some(f(path))
         } else {
@@ -56,9 +60,9 @@ impl DiskStateCache {
     /// Note: this writes the state on a new spawned task
     ///
     /// Caution: this requires a running tokio Runtime.
-    pub fn write(&mut self, hash: H256, state: StateSnapshot) {
+    pub fn write(&mut self, hash: B256, state: StateSnapshot) {
         self.with_cache_file(hash, |file| {
-            tokio::task::spawn(async move {
+            tokio::task::spawn_blocking(move || {
                 match foundry_common::fs::write_json_file(&file, &state) {
                     Ok(_) => {
                         trace!(target: "backend", ?hash, "wrote state json file");
@@ -74,7 +78,7 @@ impl DiskStateCache {
     /// Loads the snapshot file for the given hash
     ///
     /// Returns None if it doesn't exist or deserialization failed
-    pub fn read(&mut self, hash: H256) -> Option<StateSnapshot> {
+    pub fn read(&mut self, hash: B256) -> Option<StateSnapshot> {
         self.with_cache_file(hash, |file| {
             match foundry_common::fs::read_json_file::<StateSnapshot>(&file) {
                 Ok(state) => {
@@ -91,7 +95,7 @@ impl DiskStateCache {
     }
 
     /// Removes the cache file for the given hash, if it exists
-    pub fn remove(&mut self, hash: H256) {
+    pub fn remove(&mut self, hash: B256) {
         self.with_cache_file(hash, |file| {
             foundry_common::fs::remove_file(file).map_err(|err| {
                 error!(target: "backend", %err, %hash, "Failed to remove state snapshot");
@@ -102,7 +106,7 @@ impl DiskStateCache {
 
 impl Default for DiskStateCache {
     fn default() -> Self {
-        DiskStateCache { temp_path: anvil_tmp_dir(), temp_dir: None }
+        Self { temp_path: anvil_tmp_dir(), temp_dir: None }
     }
 }
 
@@ -115,11 +119,7 @@ fn build_tmp_dir(p: Option<&Path>) -> io::Result<TempDir> {
     let prefix = now.format("anvil-state-%d-%m-%Y-%H-%M").to_string();
     builder.prefix(&prefix);
 
-    if let Some(p) = p {
-        builder.tempdir_in(p)
-    } else {
-        builder.tempdir()
-    }
+    if let Some(p) = p { builder.tempdir_in(p) } else { builder.tempdir() }
 }
 
 #[cfg(test)]
@@ -132,20 +132,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let p = dir.path();
         let cache_dir = build_tmp_dir(Some(p)).unwrap();
-        assert!(cache_dir
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("anvil-state-"));
+        assert!(
+            cache_dir.path().file_name().unwrap().to_str().unwrap().starts_with("anvil-state-")
+        );
         let cache_dir = build_tmp_dir(None).unwrap();
-        assert!(cache_dir
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("anvil-state-"));
+        assert!(
+            cache_dir.path().file_name().unwrap().to_str().unwrap().starts_with("anvil-state-")
+        );
     }
 }

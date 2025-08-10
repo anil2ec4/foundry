@@ -1,171 +1,77 @@
-use alloy_json_abi::{Function, JsonAbi as Abi};
-use alloy_primitives::{Address, FixedBytes, B256};
-use ethers_core::types::{ActionType, Block, CallType, Chain, Transaction, H256, U256};
-use eyre::ContextCompat;
-use foundry_common::types::ToAlloy;
-use revm::{
-    interpreter::{opcode, opcode::spec_opcode_gas, CallScheme, CreateInputs, InstructionResult},
-    primitives::{CreateScheme, Eval, Halt, SpecId, TransactTo},
+use crate::EnvMut;
+use alloy_chains::Chain;
+use alloy_consensus::BlockHeader;
+use alloy_hardforks::EthereumHardfork;
+use alloy_json_abi::{Function, JsonAbi};
+use alloy_network::{AnyTxEnvelope, TransactionResponse};
+use alloy_primitives::{Address, B256, ChainId, Selector, TxKind, U256};
+use alloy_provider::{Network, network::BlockResponse};
+use alloy_rpc_types::{Transaction, TransactionRequest};
+use foundry_config::NamedChain;
+use revm::primitives::{
+    eip4844::{BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE},
+    hardfork::SpecId,
 };
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+pub use revm::state::EvmState as StateChangeset;
 
-pub use foundry_compilers::utils::RuntimeOrHandle;
-pub use revm::primitives::State as StateChangeset;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-#[derive(Default)]
-pub enum CallKind {
-    #[default]
-    Call,
-    StaticCall,
-    CallCode,
-    DelegateCall,
-    Create,
-    Create2,
-}
-
-impl From<CallScheme> for CallKind {
-    fn from(scheme: CallScheme) -> Self {
-        match scheme {
-            CallScheme::Call => CallKind::Call,
-            CallScheme::StaticCall => CallKind::StaticCall,
-            CallScheme::CallCode => CallKind::CallCode,
-            CallScheme::DelegateCall => CallKind::DelegateCall,
-        }
-    }
-}
-
-impl From<CreateScheme> for CallKind {
-    fn from(create: CreateScheme) -> Self {
-        match create {
-            CreateScheme::Create => CallKind::Create,
-            CreateScheme::Create2 { .. } => CallKind::Create2,
-        }
-    }
-}
-
-impl From<CallKind> for ActionType {
-    fn from(kind: CallKind) -> Self {
-        match kind {
-            CallKind::Call | CallKind::StaticCall | CallKind::DelegateCall | CallKind::CallCode => {
-                ActionType::Call
-            }
-            CallKind::Create => ActionType::Create,
-            CallKind::Create2 => ActionType::Create,
-        }
-    }
-}
-
-impl From<CallKind> for CallType {
-    fn from(ty: CallKind) -> Self {
-        match ty {
-            CallKind::Call => CallType::Call,
-            CallKind::StaticCall => CallType::StaticCall,
-            CallKind::CallCode => CallType::CallCode,
-            CallKind::DelegateCall => CallType::DelegateCall,
-            CallKind::Create => CallType::None,
-            CallKind::Create2 => CallType::None,
-        }
-    }
-}
-
-/// Small helper function to convert [U256] into [H256].
-#[inline]
-pub fn u256_to_h256_le(u: U256) -> H256 {
-    let mut h = H256::default();
-    u.to_little_endian(h.as_mut());
-    h
-}
-
-/// Small helper function to convert [U256] into [H256].
-#[inline]
-pub fn u256_to_h256_be(u: U256) -> H256 {
-    let mut h = H256::default();
-    u.to_big_endian(h.as_mut());
-    h
-}
-
-/// Small helper function to convert [H256] into [U256].
-#[inline]
-pub fn h256_to_u256_be(storage: H256) -> U256 {
-    U256::from_big_endian(storage.as_bytes())
-}
-
-/// Small helper function to convert [H256] into [U256].
-#[inline]
-pub fn h256_to_u256_le(storage: H256) -> U256 {
-    U256::from_little_endian(storage.as_bytes())
-}
-
-/// Small helper function to convert an Eval into an InstructionResult
-#[inline]
-pub fn eval_to_instruction_result(eval: Eval) -> InstructionResult {
-    match eval {
-        Eval::Return => InstructionResult::Return,
-        Eval::Stop => InstructionResult::Stop,
-        Eval::SelfDestruct => InstructionResult::SelfDestruct,
-    }
-}
-
-/// Small helper function to convert a Halt into an InstructionResult
-#[inline]
-pub fn halt_to_instruction_result(halt: Halt) -> InstructionResult {
-    match halt {
-        Halt::OutOfGas(_) => InstructionResult::OutOfGas,
-        Halt::OpcodeNotFound => InstructionResult::OpcodeNotFound,
-        Halt::InvalidFEOpcode => InstructionResult::InvalidFEOpcode,
-        Halt::InvalidJump => InstructionResult::InvalidJump,
-        Halt::NotActivated => InstructionResult::NotActivated,
-        Halt::StackOverflow => InstructionResult::StackOverflow,
-        Halt::StackUnderflow => InstructionResult::StackUnderflow,
-        Halt::OutOfOffset => InstructionResult::OutOfOffset,
-        Halt::CreateCollision => InstructionResult::CreateCollision,
-        Halt::PrecompileError => InstructionResult::PrecompileError,
-        Halt::NonceOverflow => InstructionResult::NonceOverflow,
-        Halt::CreateContractSizeLimit => InstructionResult::CreateContractSizeLimit,
-        Halt::CreateContractStartingWithEF => InstructionResult::CreateContractStartingWithEF,
-        Halt::CreateInitcodeSizeLimit => InstructionResult::CreateInitcodeSizeLimit,
-        Halt::OverflowPayment => InstructionResult::OverflowPayment,
-        Halt::StateChangeDuringStaticCall => InstructionResult::StateChangeDuringStaticCall,
-        Halt::CallNotAllowedInsideStatic => InstructionResult::CallNotAllowedInsideStatic,
-        Halt::OutOfFund => InstructionResult::OutOfFund,
-        Halt::CallTooDeep => InstructionResult::CallTooDeep,
-        Halt::FailedDeposit => InstructionResult::Return,
-    }
+/// Hints to the compiler that this is a cold path, i.e. unlikely to be taken.
+#[cold]
+#[inline(always)]
+pub fn cold_path() {
+    // TODO: remove `#[cold]` and call `std::hint::cold_path` once stable.
 }
 
 /// Depending on the configured chain id and block number this should apply any specific changes
 ///
-/// This checks for:
-///    - prevrandao mixhash after merge
-pub fn apply_chain_and_block_specific_env_changes<T>(
-    env: &mut revm::primitives::Env,
-    block: &Block<T>,
+/// - checks for prevrandao mixhash after merge
+/// - applies chain specifics: on Arbitrum `block.number` is the L1 block
+///
+/// Should be called with proper chain id (retrieved from provider if not provided).
+pub fn apply_chain_and_block_specific_env_changes<N: Network>(
+    env: EnvMut<'_>,
+    block: &N::BlockResponse,
 ) {
-    if let Ok(chain) = Chain::try_from(env.cfg.chain_id) {
-        let block_number = block.number.unwrap_or_default();
+    use NamedChain::*;
+
+    if let Ok(chain) = NamedChain::try_from(env.cfg.chain_id) {
+        let block_number = block.header().number();
 
         match chain {
-            Chain::Mainnet => {
+            Mainnet => {
                 // after merge difficulty is supplanted with prevrandao EIP-4399
-                if block_number.as_u64() >= 15_537_351u64 {
+                if block_number >= 15_537_351u64 {
                     env.block.difficulty = env.block.prevrandao.unwrap_or_default().into();
                 }
 
-                return
+                return;
             }
-            Chain::Arbitrum |
-            Chain::ArbitrumGoerli |
-            Chain::ArbitrumNova |
-            Chain::ArbitrumTestnet => {
+            BinanceSmartChain | BinanceSmartChainTestnet => {
+                // https://github.com/foundry-rs/foundry/issues/9942
+                // As far as observed from the source code of bnb-chain/bsc, the `difficulty` field
+                // is still in use and returned by the corresponding opcode but `prevrandao`
+                // (`mixHash`) is always zero, even though bsc adopts the newer EVM
+                // specification. This will confuse revm and causes emulation
+                // failure.
+                env.block.prevrandao = Some(env.block.difficulty.into());
+                return;
+            }
+            Moonbeam | Moonbase | Moonriver | MoonbeamDev | Rsk | RskTestnet => {
+                if env.block.prevrandao.is_none() {
+                    // <https://github.com/foundry-rs/foundry/issues/4232>
+                    env.block.prevrandao = Some(B256::random());
+                }
+            }
+            c if c.is_arbitrum() => {
                 // on arbitrum `block.number` is the L1 block which is included in the
                 // `l1BlockNumber` field
-                if let Some(l1_block_number) = block.other.get("l1BlockNumber").cloned() {
-                    if let Ok(l1_block_number) = serde_json::from_value::<U256>(l1_block_number) {
-                        env.block.number = l1_block_number.to_alloy();
-                    }
+                if let Some(l1_block_number) = block
+                    .other_fields()
+                    .and_then(|other| other.get("l1BlockNumber").cloned())
+                    .and_then(|l1_block_number| {
+                        serde_json::from_value::<U256>(l1_block_number).ok()
+                    })
+                {
+                    env.block.number = l1_block_number.to();
                 }
             }
             _ => {}
@@ -173,113 +79,109 @@ pub fn apply_chain_and_block_specific_env_changes<T>(
     }
 
     // if difficulty is `0` we assume it's past merge
-    if block.difficulty.is_zero() {
+    if block.header().difficulty().is_zero() {
         env.block.difficulty = env.block.prevrandao.unwrap_or_default().into();
     }
 }
 
-/// A map of program counters to instruction counters.
-pub type PCICMap = BTreeMap<usize, usize>;
+/// Derive the blob base fee update fraction based on the chain and timestamp by checking the
+/// hardfork.
+pub fn get_blob_base_fee_update_fraction(chain_id: ChainId, timestamp: u64) -> u64 {
+    let hardfork = EthereumHardfork::from_chain_and_timestamp(Chain::from_id(chain_id), timestamp)
+        .unwrap_or_default();
 
-/// Builds a mapping from program counters to instruction counters.
-pub fn build_pc_ic_map(spec: SpecId, code: &[u8]) -> PCICMap {
-    let opcode_infos = spec_opcode_gas(spec);
-    let mut pc_ic_map: PCICMap = BTreeMap::new();
-
-    let mut i = 0;
-    let mut cumulative_push_size = 0;
-    while i < code.len() {
-        let op = code[i];
-        pc_ic_map.insert(i, i - cumulative_push_size);
-        if opcode_infos[op as usize].is_push() {
-            // Skip the push bytes.
-            //
-            // For more context on the math, see: https://github.com/bluealloy/revm/blob/007b8807b5ad7705d3cacce4d92b89d880a83301/crates/revm/src/interpreter/contract.rs#L114-L115
-            i += (op - opcode::PUSH1 + 1) as usize;
-            cumulative_push_size += (op - opcode::PUSH1 + 1) as usize;
-        }
-        i += 1;
+    if hardfork >= EthereumHardfork::Prague {
+        BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE
+    } else {
+        BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN
     }
-
-    pc_ic_map
 }
 
-/// A map of instruction counters to program counters.
-pub type ICPCMap = BTreeMap<usize, usize>;
-
-/// Builds a mapping from instruction counters to program counters.
-pub fn build_ic_pc_map(spec: SpecId, code: &[u8]) -> ICPCMap {
-    let opcode_infos = spec_opcode_gas(spec);
-    let mut ic_pc_map: ICPCMap = ICPCMap::new();
-
-    let mut i = 0;
-    let mut cumulative_push_size = 0;
-    while i < code.len() {
-        let op = code[i];
-        ic_pc_map.insert(i - cumulative_push_size, i);
-        if opcode_infos[op as usize].is_push() {
-            // Skip the push bytes.
-            //
-            // For more context on the math, see: https://github.com/bluealloy/revm/blob/007b8807b5ad7705d3cacce4d92b89d880a83301/crates/revm/src/interpreter/contract.rs#L114-L115
-            i += (op - opcode::PUSH1 + 1) as usize;
-            cumulative_push_size += (op - opcode::PUSH1 + 1) as usize;
-        }
-        i += 1;
+/// Returns the blob base fee update fraction based on the spec id.
+pub fn get_blob_base_fee_update_fraction_by_spec_id(spec: SpecId) -> u64 {
+    if spec >= SpecId::PRAGUE {
+        BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE
+    } else {
+        BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN
     }
-
-    ic_pc_map
 }
 
 /// Given an ABI and selector, it tries to find the respective function.
-pub fn get_function(
+pub fn get_function<'a>(
     contract_name: &str,
-    selector: &FixedBytes<4>,
-    abi: &Abi,
-) -> eyre::Result<Function> {
+    selector: Selector,
+    abi: &'a JsonAbi,
+) -> eyre::Result<&'a Function> {
     abi.functions()
-        .find(|func| func.selector().as_slice() == selector.as_slice())
-        .cloned()
-        .wrap_err(format!("{contract_name} does not have the selector {selector:?}"))
+        .find(|func| func.selector() == selector)
+        .ok_or_else(|| eyre::eyre!("{contract_name} does not have the selector {selector}"))
 }
 
-/// Configures the env for the transaction
-pub fn configure_tx_env(env: &mut revm::primitives::Env, tx: &Transaction) {
-    env.tx.caller = tx.from.to_alloy();
-    env.tx.gas_limit = tx.gas.as_u64();
-    env.tx.gas_price = tx.gas_price.unwrap_or_default().to_alloy();
-    env.tx.gas_priority_fee = tx.max_priority_fee_per_gas.map(|g| g.to_alloy());
-    env.tx.nonce = Some(tx.nonce.as_u64());
-    env.tx.access_list = tx
-        .access_list
-        .clone()
-        .unwrap_or_default()
-        .0
-        .into_iter()
-        .map(|item| {
-            (
-                item.address.to_alloy(),
-                item.storage_keys.into_iter().map(h256_to_u256_be).map(|g| g.to_alloy()).collect(),
-            )
-        })
-        .collect();
-    env.tx.value = tx.value.to_alloy();
-    env.tx.data = alloy_primitives::Bytes(tx.input.0.clone());
-    env.tx.transact_to =
-        tx.to.map(|tx| tx.to_alloy()).map(TransactTo::Call).unwrap_or_else(TransactTo::create)
-}
-
-/// Get the address of a contract creation
-pub fn get_create_address(call: &CreateInputs, nonce: u64) -> Address {
-    match call.scheme {
-        CreateScheme::Create => call.caller.create(nonce),
-        CreateScheme::Create2 { salt } => {
-            call.caller.create2_from_code(B256::from(salt), &call.init_code)
-        }
+/// Configures the env for the given RPC transaction.
+/// Accounts for an impersonated transaction by resetting the `env.tx.caller` field to `tx.from`.
+pub fn configure_tx_env(env: &mut EnvMut<'_>, tx: &Transaction<AnyTxEnvelope>) {
+    let from = tx.from();
+    if let AnyTxEnvelope::Ethereum(tx) = &tx.inner.inner() {
+        configure_tx_req_env(env, &tx.clone().into(), Some(from)).expect("cannot fail");
     }
 }
 
-/// Get the gas used, accounting for refunds
-pub fn gas_used(spec: SpecId, spent: u64, refunded: u64) -> u64 {
-    let refund_quotient = if SpecId::enabled(spec, SpecId::LONDON) { 5 } else { 2 };
-    spent - (refunded).min(spent / refund_quotient)
+/// Configures the env for the given RPC transaction request.
+/// `impersonated_from` is the address of the impersonated account. This helps account for an
+/// impersonated transaction by resetting the `env.tx.caller` field to `impersonated_from`.
+pub fn configure_tx_req_env(
+    env: &mut EnvMut<'_>,
+    tx: &TransactionRequest,
+    impersonated_from: Option<Address>,
+) -> eyre::Result<()> {
+    // If no transaction type is provided, we need to infer it from the other fields.
+    let tx_type = tx.transaction_type.unwrap_or_else(|| tx.minimal_tx_type() as u8);
+    env.tx.tx_type = tx_type;
+
+    let TransactionRequest {
+        nonce,
+        from,
+        to,
+        value,
+        gas_price,
+        gas,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        max_fee_per_blob_gas,
+        ref input,
+        chain_id,
+        ref blob_versioned_hashes,
+        ref access_list,
+        ref authorization_list,
+        transaction_type: _,
+        sidecar: _,
+    } = *tx;
+
+    // If no `to` field then set create kind: https://eips.ethereum.org/EIPS/eip-2470#deployment-transaction
+    env.tx.kind = to.unwrap_or(TxKind::Create);
+    // If the transaction is impersonated, we need to set the caller to the from
+    // address Ref: https://github.com/foundry-rs/foundry/issues/9541
+    env.tx.caller =
+        impersonated_from.unwrap_or(from.ok_or_else(|| eyre::eyre!("missing `from` field"))?);
+    env.tx.gas_limit = gas.ok_or_else(|| eyre::eyre!("missing `gas` field"))?;
+    env.tx.nonce = nonce.unwrap_or_default();
+    env.tx.value = value.unwrap_or_default();
+    env.tx.data = input.input().cloned().unwrap_or_default();
+    env.tx.chain_id = chain_id;
+
+    // Type 1, EIP-2930
+    env.tx.access_list = access_list.clone().unwrap_or_default();
+
+    // Type 2, EIP-1559
+    env.tx.gas_price = gas_price.or(max_fee_per_gas).unwrap_or_default();
+    env.tx.gas_priority_fee = max_priority_fee_per_gas;
+
+    // Type 3, EIP-4844
+    env.tx.blob_hashes = blob_versioned_hashes.clone().unwrap_or_default();
+    env.tx.max_fee_per_blob_gas = max_fee_per_blob_gas.unwrap_or_default();
+
+    // Type 4, EIP-7702
+    env.tx.set_signed_authorization(authorization_list.clone().unwrap_or_default());
+
+    Ok(())
 }

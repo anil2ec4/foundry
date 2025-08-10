@@ -1,12 +1,9 @@
 use chisel::session::ChiselSession;
-use foundry_compilers::EvmVersion;
+use foundry_compilers::artifacts::EvmVersion;
 use foundry_config::Config;
-use foundry_evm::opts::EvmOpts;
-use serial_test::serial;
 use std::path::Path;
 
 #[test]
-#[serial]
 fn test_cache_directory() {
     // Get the cache dir
     // Should be ~/.foundry/cache/chisel
@@ -18,7 +15,6 @@ fn test_cache_directory() {
 }
 
 #[test]
-#[serial]
 fn test_create_cache_directory() {
     // Get the cache dir
     let cache_dir = ChiselSession::cache_dir().unwrap();
@@ -31,7 +27,6 @@ fn test_create_cache_directory() {
 }
 
 #[test]
-#[serial]
 fn test_write_session() {
     // Create the cache directory if it doesn't exist
     let cache_dir = ChiselSession::cache_dir().unwrap();
@@ -43,12 +38,9 @@ fn test_write_session() {
     // Create a new session
     let mut env = ChiselSession::new(chisel::session_source::SessionSourceConfig {
         foundry_config,
-        evm_opts: EvmOpts::default(),
-        backend: None,
-        traces: false,
-        calldata: None,
+        ..Default::default()
     })
-    .unwrap_or_else(|e| panic!("Failed to create ChiselSession!, {}", e));
+    .unwrap_or_else(|e| panic!("Failed to create ChiselSession!, {e}"));
 
     // Write the session
     let cached_session_name = env.write().unwrap();
@@ -62,7 +54,6 @@ fn test_write_session() {
 }
 
 #[test]
-#[serial]
 fn test_write_session_with_name() {
     // Create the cache directory if it doesn't exist
     let cache_dir = ChiselSession::cache_dir().unwrap();
@@ -76,7 +67,7 @@ fn test_write_session_with_name() {
         foundry_config,
         ..Default::default()
     })
-    .unwrap_or_else(|e| panic!("Failed to create ChiselSession! {}", e));
+    .unwrap_or_else(|e| panic!("Failed to create ChiselSession! {e}"));
     env.id = Some(String::from("test"));
 
     // Write the session
@@ -87,7 +78,6 @@ fn test_write_session_with_name() {
 }
 
 #[test]
-#[serial]
 fn test_clear_cache() {
     // Create a session to validate clearing a non-empty cache directory
     let cache_dir = ChiselSession::cache_dir().unwrap();
@@ -112,7 +102,6 @@ fn test_clear_cache() {
 }
 
 #[test]
-#[serial]
 fn test_list_sessions() {
     // Create and clear the cache directory
     ChiselSession::create_cache_dir().unwrap();
@@ -126,7 +115,7 @@ fn test_list_sessions() {
         foundry_config,
         ..Default::default()
     })
-    .unwrap_or_else(|e| panic!("Failed to create ChiselSession! {}", e));
+    .unwrap_or_else(|e| panic!("Failed to create ChiselSession! {e}"));
 
     env.write().unwrap();
 
@@ -139,7 +128,6 @@ fn test_list_sessions() {
 }
 
 #[test]
-#[serial]
 fn test_load_cache() {
     // Create and clear the cache directory
     ChiselSession::create_cache_dir().unwrap();
@@ -153,7 +141,7 @@ fn test_load_cache() {
         foundry_config,
         ..Default::default()
     })
-    .unwrap_or_else(|e| panic!("Failed to create ChiselSession! {}", e));
+    .unwrap_or_else(|e| panic!("Failed to create ChiselSession! {e}"));
     env.write().unwrap();
 
     // Load the session
@@ -163,14 +151,10 @@ fn test_load_cache() {
     assert!(new_env.is_ok());
     let new_env = new_env.unwrap();
     assert_eq!(new_env.id.unwrap(), String::from("0"));
-    assert_eq!(
-        new_env.session_source.unwrap().to_repl_source(),
-        env.session_source.unwrap().to_repl_source()
-    );
+    assert_eq!(new_env.session_source.to_repl_source(), env.session_source.to_repl_source());
 }
 
 #[test]
-#[serial]
 fn test_write_same_session_multiple_times() {
     // Create and clear the cache directory
     ChiselSession::create_cache_dir().unwrap();
@@ -184,7 +168,7 @@ fn test_write_same_session_multiple_times() {
         foundry_config,
         ..Default::default()
     })
-    .unwrap_or_else(|e| panic!("Failed to create ChiselSession! {}", e));
+    .unwrap_or_else(|e| panic!("Failed to create ChiselSession! {e}"));
     env.write().unwrap();
     env.write().unwrap();
     env.write().unwrap();
@@ -193,7 +177,6 @@ fn test_write_same_session_multiple_times() {
 }
 
 #[test]
-#[serial]
 fn test_load_latest_cache() {
     // Create and clear the cache directory
     ChiselSession::create_cache_dir().unwrap();
@@ -207,7 +190,7 @@ fn test_load_latest_cache() {
         foundry_config: foundry_config.clone(),
         ..Default::default()
     })
-    .unwrap_or_else(|e| panic!("Failed to create ChiselSession! {}", e));
+    .unwrap_or_else(|e| panic!("Failed to create ChiselSession! {e}"));
     env.write().unwrap();
 
     let wait_time = std::time::Duration::from_millis(100);
@@ -217,7 +200,7 @@ fn test_load_latest_cache() {
         foundry_config,
         ..Default::default()
     })
-    .unwrap_or_else(|e| panic!("Failed to create ChiselSession! {}", e));
+    .unwrap_or_else(|e| panic!("Failed to create ChiselSession! {e}"));
     env2.write().unwrap();
 
     // Load the latest session
@@ -225,8 +208,5 @@ fn test_load_latest_cache() {
 
     // Validate the session
     assert_eq!(new_env.id.unwrap(), "1");
-    assert_eq!(
-        new_env.session_source.unwrap().to_repl_source(),
-        env.session_source.unwrap().to_repl_source()
-    );
+    assert_eq!(new_env.session_source.to_repl_source(), env.session_source.to_repl_source());
 }

@@ -1,7 +1,8 @@
-/// A macro to implement converters from a type to [`Config`] and [`figment::Figment`]
+/// A macro to implement converters from a type to [`Config`](crate::Config) and
+/// [`figment::Figment`].
 ///
 /// This can be used to remove some boilerplate code that's necessary to add additional layer(s) to
-/// the [`Config`]'s default `Figment`.
+/// the `Config`'s default `Figment`.
 ///
 /// `impl_figment` takes the default `Config` and merges additional `Provider`, therefore the
 /// targeted type, requires an implementation of `figment::Profile`.
@@ -9,7 +10,7 @@
 /// # Example
 ///
 /// Use `impl_figment` on a type with a `root: Option<PathBuf>` field, which will be used for
-/// [`Config::figment_with_root()`]
+/// [`Config::figment_with_root()`](crate::Config::figment_with_root).
 ///
 /// ```rust
 /// use std::path::PathBuf;
@@ -30,7 +31,7 @@
 ///         Metadata::default()
 ///     }
 ///
-///     fn data(&self) -> Result<Map<Profile, Dict>, Error> {
+///     fn data(&self) -> std::result::Result<Map<Profile, Dict>, Error> {
 ///         let value = Value::serialize(self)?;
 ///         let error = InvalidType(value.to_actual(), "map".into());
 ///         let mut dict = value.into_dict().ok_or(error)?;
@@ -39,7 +40,6 @@
 /// }
 ///
 /// let figment: Figment = From::from(&MyArgs::default());
-/// let config: Config = From::from(&MyArgs::default());
 ///
 ///  // Use `impl_figment` on a type that has several nested `Provider` as fields but is _not_ a `Provider` itself
 ///
@@ -52,26 +52,13 @@
 /// impl_figment_convert!(Outer, start, second, third);
 ///
 /// let figment: Figment = From::from(&Outer::default());
-/// let config: Config = From::from(&Outer::default());
 /// ```
 #[macro_export]
 macro_rules! impl_figment_convert {
     ($name:ty) => {
         impl<'a> From<&'a $name> for $crate::figment::Figment {
             fn from(args: &'a $name) -> Self {
-                if let Some(root) = args.root.clone() {
-                    $crate::Config::figment_with_root(root)
-                } else {
-                    $crate::Config::figment_with_root($crate::find_project_root_path(None).unwrap())
-                }
-                .merge(args)
-            }
-        }
-
-        impl<'a> From<&'a $name> for $crate::Config {
-            fn from(args: &'a $name) -> Self {
-                let figment: $crate::figment::Figment = args.into();
-                $crate::Config::from_provider(figment).sanitized()
+                $crate::Config::figment_with_root_opt(args.root.as_deref()).merge(args)
             }
         }
     };
@@ -79,17 +66,10 @@ macro_rules! impl_figment_convert {
         impl<'a> From<&'a $name> for $crate::figment::Figment {
             fn from(args: &'a $name) -> Self {
                 let mut figment: $crate::figment::Figment = From::from(&args.$start);
-                $ (
-                  figment =  figment.merge(&args.$more);
+                $(
+                    figment = figment.merge(&args.$more);
                 )*
                 figment
-            }
-        }
-
-        impl<'a> From<&'a $name> for $crate::Config {
-            fn from(args: &'a $name) -> Self {
-                let figment: $crate::figment::Figment = args.into();
-                $crate::Config::from_provider(figment).sanitized()
             }
         }
     };
@@ -97,18 +77,11 @@ macro_rules! impl_figment_convert {
         impl<'a> From<&'a $name> for $crate::figment::Figment {
             fn from(args: &'a $name) -> Self {
                 let mut figment: $crate::figment::Figment = From::from(&args.$start);
-                $ (
-                  figment =  figment.merge(&args.$more);
+                $(
+                    figment = figment.merge(&args.$more);
                 )*
                 figment = figment.merge(args);
                 figment
-            }
-        }
-
-        impl<'a> From<&'a $name> for $crate::Config {
-            fn from(args: &'a $name) -> Self {
-                let figment: $crate::figment::Figment = args.into();
-                $crate::Config::from_provider(figment).sanitized()
             }
         }
     };
@@ -122,8 +95,9 @@ macro_rules! impl_figment_convert {
 ///
 /// ```rust
 /// use foundry_config::{
+///     Config,
 ///     figment::{value::*, *},
-///     impl_figment_convert, merge_impl_figment_convert, Config,
+///     impl_figment_convert, merge_impl_figment_convert,
 /// };
 /// use std::path::PathBuf;
 ///
@@ -137,7 +111,7 @@ macro_rules! impl_figment_convert {
 ///         Metadata::default()
 ///     }
 ///
-///     fn data(&self) -> Result<Map<Profile, Dict>, Error> {
+///     fn data(&self) -> std::result::Result<Map<Profile, Dict>, Error> {
 ///         todo!()
 ///     }
 /// }
@@ -155,7 +129,7 @@ macro_rules! impl_figment_convert {
 ///         Metadata::default()
 ///     }
 ///
-///     fn data(&self) -> Result<Map<Profile, Dict>, Error> {
+///     fn data(&self) -> std::result::Result<Map<Profile, Dict>, Error> {
 ///         todo!()
 ///     }
 /// }
@@ -175,31 +149,24 @@ macro_rules! merge_impl_figment_convert {
                 figment
             }
         }
-
-        impl<'a> From<&'a $name> for $crate::Config {
-            fn from(args: &'a $name) -> Self {
-                let figment: $crate::figment::Figment = args.into();
-                $crate::Config::from_provider(figment).sanitized()
-            }
-        }
     };
 }
 
-/// A macro to implement converters from a type to [`Config`] and [`figment::Figment`]
+/// A macro to implement converters from a type to [`Config`](crate::Config) and
+/// [`figment::Figment`].
+///
+/// Via [Config::to_figment](crate::Config::to_figment) and the
+/// [Cast](crate::FigmentProviders::Cast) profile.
 #[macro_export]
 macro_rules! impl_figment_convert_cast {
     ($name:ty) => {
         impl<'a> From<&'a $name> for $crate::figment::Figment {
             fn from(args: &'a $name) -> Self {
-                $crate::Config::figment_with_root($crate::find_project_root_path(None).unwrap())
+                let root =
+                    $crate::find_project_root(None).expect("could not determine project root");
+                $crate::Config::with_root(&root)
+                    .to_figment($crate::FigmentProviders::Cast)
                     .merge(args)
-            }
-        }
-
-        impl<'a> From<&'a $name> for $crate::Config {
-            fn from(args: &'a $name) -> Self {
-                let figment: $crate::figment::Figment = args.into();
-                $crate::Config::from_provider(figment).sanitized()
             }
         }
     };

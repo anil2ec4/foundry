@@ -1,4 +1,4 @@
-use crate::{error::RequestError, handler::handle_request, RpcHandler};
+use crate::{RpcHandler, error::RequestError, handler::handle_request};
 use anvil_rpc::{
     error::RpcError,
     request::Request,
@@ -11,7 +11,6 @@ use serde::de::DeserializeOwned;
 use std::{
     collections::VecDeque,
     fmt,
-    future::Future,
     hash::Hash,
     pin::Pin,
     sync::Arc,
@@ -39,8 +38,6 @@ pub struct PubSubContext<Handler: PubSubRpcHandler> {
     /// all active subscriptions `id -> Stream`
     subscriptions: Subscriptions<Handler::SubscriptionId, Handler::Subscription>,
 }
-
-// === impl PubSubContext ===
 
 impl<Handler: PubSubRpcHandler> PubSubContext<Handler> {
     /// Adds new active subscription
@@ -70,7 +67,7 @@ impl<Handler: PubSubRpcHandler> PubSubContext<Handler> {
         let mut subscriptions = self.subscriptions.lock();
         if let Some(idx) = subscriptions.iter().position(|(i, _)| id == i) {
             trace!(target: "rpc", ?id,  "removed subscription");
-            return Some(subscriptions.swap_remove(idx).1)
+            return Some(subscriptions.swap_remove(idx).1);
         }
         None
     }
@@ -125,8 +122,6 @@ pub struct PubSubConnection<Handler: PubSubRpcHandler, Connection> {
     pending: VecDeque<String>,
 }
 
-// === impl PubSubConnection ===
-
 impl<Handler: PubSubRpcHandler, Connection> PubSubConnection<Handler, Connection> {
     pub fn new(connection: Connection, handler: Handler) -> Self {
         Self {
@@ -171,14 +166,14 @@ where
         let pin = self.get_mut();
         loop {
             // drive the websocket
-            while let Poll::Ready(Ok(())) = pin.connection.poll_ready_unpin(cx) {
+            while matches!(pin.connection.poll_ready_unpin(cx), Poll::Ready(Ok(()))) {
                 // only start sending if socket is ready
                 if let Some(msg) = pin.pending.pop_front() {
                     if let Err(err) = pin.connection.start_send_unpin(msg) {
                         error!(target: "rpc", ?err, "Failed to send message");
                     }
                 } else {
-                    break
+                    break;
                 }
             }
 
@@ -187,7 +182,7 @@ where
             if let Poll::Ready(Err(err)) = pin.connection.poll_flush_unpin(cx) {
                 trace!(target: "rpc", ?err, "websocket err");
                 // close the connection
-                return Poll::Ready(())
+                return Poll::Ready(());
             }
 
             loop {
@@ -199,25 +194,25 @@ where
                         Err(err) => match err {
                             RequestError::Axum(err) => {
                                 trace!(target: "rpc", ?err, "client disconnected");
-                                return Poll::Ready(())
+                                return Poll::Ready(());
                             }
                             RequestError::Io(err) => {
                                 trace!(target: "rpc", ?err, "client disconnected");
-                                return Poll::Ready(())
+                                return Poll::Ready(());
                             }
                             RequestError::Serde(err) => {
                                 pin.process_request(Err(err));
                             }
                             RequestError::Disconnect => {
                                 trace!(target: "rpc", "client disconnected");
-                                return Poll::Ready(())
+                                return Poll::Ready(());
                             }
                         },
                         _ => {}
                     },
                     Poll::Ready(None) => {
                         trace!(target: "rpc", "socket connection finished");
-                        return Poll::Ready(())
+                        return Poll::Ready(());
                     }
                     Poll::Pending => break,
                 }
@@ -260,7 +255,7 @@ where
             }
 
             if !progress {
-                return Poll::Pending
+                return Poll::Pending;
             }
         }
     }

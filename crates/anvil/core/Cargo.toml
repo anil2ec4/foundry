@@ -9,35 +9,33 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 foundry-common.workspace = true
 foundry-evm.workspace = true
+revm = { workspace = true, default-features = false, features = [
+    "std",
+    "serde",
+    "memory_limit",
+    "c-kzg",
+] }
+op-revm.workspace = true
 
-alloy-primitives = { workspace = true, features = ["serde"] }
-revm = { workspace = true, default-features = false, features = ["std", "serde", "memory_limit"] }
-ethers-core = { workspace = true, features = ["optimism"] }
-# theses are not used by anvil-core, but are required by ethers, because pulled in via foundry-common
-ethers-contract = { workspace = true, features = ["optimism"] }
-ethers-providers = { workspace = true, features = ["optimism"] }
-ethers-middleware = { workspace = true, features = ["optimism"] }
-
-serde = { workspace = true, optional = true }
+alloy-primitives = { workspace = true, features = ["serde", "rlp"] }
+alloy-rpc-types = { workspace = true, features = ["anvil", "trace"] }
+alloy-serde.workspace = true
+alloy-rlp.workspace = true
+alloy-eips.workspace = true
+alloy-consensus = { workspace = true, features = ["k256", "kzg"] }
+alloy-dyn-abi = { workspace = true, features = ["std", "eip712"] }
+op-alloy-consensus = { workspace = true, features = ["serde"] }
+alloy-network.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-bytes = { version = "1.4" }
-open-fastrlp = { version = "0.1.4", optional = true }
+bytes.workspace = true
 
-# trie
-hash-db = { version = "0.15", default-features = false }
-hash256-std-hasher = { version = "0.15", default-features = false }
-triehash = { version = "0.8", default-features = false }
-reference-trie = "0.25"
-keccak-hasher = "0.15"
-
-[dev-dependencies]
-anvil-core = { path = ".", features = ["serde"] }
-
-[features]
-default = ["serde"]
-impersonated-tx = []
-fastrlp = ["dep:open-fastrlp"]
-serde = ["dep:serde"]
+# misc
+rand.workspace = true
+thiserror.workspace = true

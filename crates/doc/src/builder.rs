@@ -1,17 +1,16 @@
 use crate::{
-    document::DocumentContent, helpers::merge_toml_table, AsDoc, BufWriter, Document, ParseItem,
-    ParseSource, Parser, Preprocessor,
+    AsDoc, BufWriter, Document, ParseItem, ParseSource, Parser, Preprocessor,
+    document::DocumentContent, helpers::merge_toml_table,
 };
+use alloy_primitives::map::HashMap;
 use forge_fmt::{FormatterConfig, Visitable};
-use foundry_common::glob::expand_globs;
-use foundry_compilers::utils::source_files_iter;
-use foundry_config::DocConfig;
+use foundry_compilers::{compilers::solc::SOLC_EXTENSIONS, utils::source_files_iter};
+use foundry_config::{DocConfig, filter::expand_globs};
 use itertools::Itertools;
 use mdbook::MDBook;
 use rayon::prelude::*;
 use std::{
     cmp::Ordering,
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -42,7 +41,7 @@ pub struct DocBuilder {
 
 // TODO: consider using `tfio`
 impl DocBuilder {
-    const SRC: &'static str = "src";
+    pub(crate) const SRC: &'static str = "src";
     const SOL_EXT: &'static str = "sol";
     const README: &'static str = "README.md";
     const SUMMARY: &'static str = "SUMMARY.md";
@@ -101,16 +100,20 @@ impl DocBuilder {
         let ignored = expand_globs(&self.root, self.config.ignore.iter())?;
 
         // Collect and parse source files
-        let sources = source_files_iter(&self.sources)
+        let sources = source_files_iter(&self.sources, SOLC_EXTENSIONS)
             .filter(|file| !ignored.contains(file))
             .collect::<Vec<_>>();
 
         if sources.is_empty() {
-            println!("No sources detected at {}", self.sources.display());
-            return Ok(())
+            sh_println!("No sources detected at {}", self.sources.display())?;
+            return Ok(());
         }
 
-        let library_sources = self.libraries.iter().flat_map(source_files_iter).collect::<Vec<_>>();
+        let library_sources = self
+            .libraries
+            .iter()
+            .flat_map(|lib| source_files_iter(lib, SOLC_EXTENSIONS))
+            .collect::<Vec<_>>();
 
         let combined_sources = sources
             .iter()
@@ -346,10 +349,19 @@ impl DocBuilder {
             .unwrap()
             .insert(String::from("title"), self.config.title.clone().into());
         if let Some(ref repo) = self.config.repository {
+            // Create the full repository URL.
+            let git_repo_url = if let Some(path) = &self.config.path {
+                // If path is specified, append it to the repository URL.
+                format!("{}/{}", repo.trim_end_matches('/'), path.trim_start_matches('/'))
+            } else {
+                // If no path specified, use repository URL as-is.
+                repo.clone()
+            };
+
             book["output"].as_table_mut().unwrap()["html"]
                 .as_table_mut()
                 .unwrap()
-                .insert(String::from("git-repository-url"), repo.clone().into());
+                .insert(String::from("git-repository-url"), git_repo_url.into());
         }
 
         // Attempt to find the user provided book path
@@ -358,11 +370,7 @@ impl DocBuilder {
                 Some(self.config.book.clone())
             } else {
                 let book_path = self.config.book.join("book.toml");
-                if book_path.is_file() {
-                    Some(book_path)
-                } else {
-                    None
-                }
+                if book_path.is_file() { Some(book_path) } else { None }
             }
         };
 
@@ -382,11 +390,11 @@ impl DocBuilder {
         depth: usize,
     ) -> eyre::Result<()> {
         if files.is_empty() {
-            return Ok(())
+            return Ok(());
         }
 
         if let Some(path) = base_path {
-            let title = path.iter().last().unwrap().to_string_lossy();
+            let title = path.iter().next_back().unwrap().to_string_lossy();
             if depth == 1 {
                 summary.write_title(&title)?;
             } else {
@@ -441,18 +449,18 @@ impl DocBuilder {
                     readme.write_link_list_item(ident, &readme_path.display().to_string(), 0)?;
                 }
             } else {
-                let name = path.iter().last().unwrap().to_string_lossy();
+                let name = path.iter().next_back().unwrap().to_string_lossy();
                 let readme_path = Path::new("/").join(&path).display().to_string();
                 readme.write_link_list_item(&name, &readme_path, 0)?;
                 self.write_summary_section(summary, &files, Some(&path), depth + 1)?;
             }
         }
-        if !readme.is_empty() {
-            if let Some(path) = base_path {
-                let path = self.out_dir().join(Self::SRC).join(path);
-                fs::create_dir_all(&path)?;
-                fs::write(path.join(Self::README), readme.finish())?;
-            }
+        if !readme.is_empty()
+            && let Some(path) = base_path
+        {
+            let path = self.out_dir().join(Self::SRC).join(path);
+            fs::create_dir_all(&path)?;
+            fs::write(path.join(Self::README), readme.finish())?;
         }
         Ok(())
     }

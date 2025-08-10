@@ -1,36 +1,286 @@
 //! Commonly used contract types and functions.
 
-use alloy_json_abi::{Event, Function, JsonAbi as Abi};
-use alloy_primitives::{hex, Address, B256};
+use crate::{compile::PathOrContractInfo, strip_bytecode_placeholders};
+use alloy_dyn_abi::JsonAbiExt;
+use alloy_json_abi::{Event, Function, JsonAbi};
+use alloy_primitives::{Address, B256, Bytes, Selector, hex};
+use eyre::{OptionExt, Result};
 use foundry_compilers::{
-    artifacts::{CompactContractBytecode, ContractBytecodeSome},
-    ArtifactId, ProjectPathsConfig,
+    ArtifactId, Project, ProjectCompileOutput,
+    artifacts::{
+        BytecodeObject, CompactBytecode, CompactContractBytecode, CompactDeployedBytecode,
+        ConfigurableContractArtifact, ContractBytecodeSome, Offsets,
+    },
+    utils::canonicalized,
 };
-use once_cell::sync::Lazy;
-use regex::Regex;
 use std::{
     collections::BTreeMap,
-    ops::{Deref, DerefMut},
-    path::PathBuf,
+    ops::Deref,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
 };
 
-type ArtifactWithContractRef<'a> = (&'a ArtifactId, &'a (Abi, Vec<u8>));
+/// Libraries' runtime code always starts with the following instruction:
+/// `PUSH20 0x0000000000000000000000000000000000000000`
+///
+/// See: <https://docs.soliditylang.org/en/latest/contracts.html#call-protection-for-libraries>
+const CALL_PROTECTION_BYTECODE_PREFIX: [u8; 21] =
+    hex!("730000000000000000000000000000000000000000");
+
+/// Subset of [CompactBytecode] excluding sourcemaps.
+#[expect(missing_docs)]
+#[derive(Debug, Clone)]
+pub struct BytecodeData {
+    pub object: Option<BytecodeObject>,
+    pub link_references: BTreeMap<String, BTreeMap<String, Vec<Offsets>>>,
+    pub immutable_references: BTreeMap<String, Vec<Offsets>>,
+}
+
+impl BytecodeData {
+    fn bytes(&self) -> Option<&Bytes> {
+        self.object.as_ref().and_then(|b| b.as_bytes())
+    }
+}
+
+impl From<CompactBytecode> for BytecodeData {
+    fn from(bytecode: CompactBytecode) -> Self {
+        Self {
+            object: Some(bytecode.object),
+            link_references: bytecode.link_references,
+            immutable_references: BTreeMap::new(),
+        }
+    }
+}
+
+impl From<CompactDeployedBytecode> for BytecodeData {
+    fn from(bytecode: CompactDeployedBytecode) -> Self {
+        let (object, link_references) = if let Some(compact) = bytecode.bytecode {
+            (Some(compact.object), compact.link_references)
+        } else {
+            (None, BTreeMap::new())
+        };
+        Self { object, link_references, immutable_references: bytecode.immutable_references }
+    }
+}
+
+/// Container for commonly used contract data.
+#[derive(Debug)]
+pub struct ContractData {
+    /// Contract name.
+    pub name: String,
+    /// Contract ABI.
+    pub abi: JsonAbi,
+    /// Contract creation code.
+    pub bytecode: Option<BytecodeData>,
+    /// Contract runtime code.
+    pub deployed_bytecode: Option<BytecodeData>,
+}
+
+impl ContractData {
+    /// Returns reference to bytes of contract creation code, if present.
+    pub fn bytecode(&self) -> Option<&Bytes> {
+        self.bytecode.as_ref()?.bytes().filter(|b| !b.is_empty())
+    }
+
+    /// Returns reference to bytes of contract deployed code, if present.
+    pub fn deployed_bytecode(&self) -> Option<&Bytes> {
+        self.deployed_bytecode.as_ref()?.bytes().filter(|b| !b.is_empty())
+    }
+
+    /// Returns the bytecode without placeholders, if present.
+    pub fn bytecode_without_placeholders(&self) -> Option<Bytes> {
+        strip_bytecode_placeholders(self.bytecode.as_ref()?.object.as_ref()?)
+    }
+
+    /// Returns the deployed bytecode without placeholders, if present.
+    pub fn deployed_bytecode_without_placeholders(&self) -> Option<Bytes> {
+        strip_bytecode_placeholders(self.deployed_bytecode.as_ref()?.object.as_ref()?)
+    }
+}
+
+type ArtifactWithContractRef<'a> = (&'a ArtifactId, &'a ContractData);
 
 /// Wrapper type that maps an artifact to a contract ABI and bytecode.
-#[derive(Default, Clone)]
-pub struct ContractsByArtifact(pub BTreeMap<ArtifactId, (Abi, Vec<u8>)>);
+#[derive(Clone, Default, Debug)]
+pub struct ContractsByArtifact(Arc<BTreeMap<ArtifactId, ContractData>>);
 
 impl ContractsByArtifact {
-    /// Finds a contract which has a similar bytecode as `code`.
-    pub fn find_by_code(&self, code: &[u8]) -> Option<ArtifactWithContractRef> {
-        self.iter().find(|(_, (_, known_code))| diff_score(known_code, code) < 0.1)
+    /// Creates a new instance by collecting all artifacts with present bytecode from an iterator.
+    pub fn new(artifacts: impl IntoIterator<Item = (ArtifactId, CompactContractBytecode)>) -> Self {
+        let map = artifacts
+            .into_iter()
+            .filter_map(|(id, artifact)| {
+                let name = id.name.clone();
+                let CompactContractBytecode { abi, bytecode, deployed_bytecode } = artifact;
+                Some((
+                    id,
+                    ContractData {
+                        name,
+                        abi: abi?,
+                        bytecode: bytecode.map(Into::into),
+                        deployed_bytecode: deployed_bytecode.map(Into::into),
+                    },
+                ))
+            })
+            .collect();
+        Self(Arc::new(map))
     }
+
+    /// Clears all contracts.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Finds a contract which has a similar bytecode as `code`.
+    pub fn find_by_creation_code(&self, code: &[u8]) -> Option<ArtifactWithContractRef<'_>> {
+        self.find_by_code(code, 0.1, true, ContractData::bytecode)
+    }
+
+    /// Finds a contract which has a similar deployed bytecode as `code`.
+    pub fn find_by_deployed_code(&self, code: &[u8]) -> Option<ArtifactWithContractRef<'_>> {
+        self.find_by_code(code, 0.15, false, ContractData::deployed_bytecode)
+    }
+
+    /// Finds a contract based on provided bytecode and accepted match score.
+    /// If strip constructor args flag is true then removes args from bytecode to compare.
+    fn find_by_code(
+        &self,
+        code: &[u8],
+        accepted_score: f64,
+        strip_ctor_args: bool,
+        get: impl Fn(&ContractData) -> Option<&Bytes>,
+    ) -> Option<ArtifactWithContractRef<'_>> {
+        self.iter()
+            .filter_map(|(id, contract)| {
+                if let Some(deployed_bytecode) = get(contract) {
+                    let mut code = code;
+                    if strip_ctor_args && code.len() > deployed_bytecode.len() {
+                        // Try to decode ctor args with contract abi.
+                        if let Some(constructor) = contract.abi.constructor() {
+                            let constructor_args = &code[deployed_bytecode.len()..];
+                            if constructor.abi_decode_input(constructor_args).is_ok() {
+                                // If we can decode args with current abi then remove args from
+                                // code to compare.
+                                code = &code[..deployed_bytecode.len()]
+                            }
+                        }
+                    };
+
+                    let score = bytecode_diff_score(deployed_bytecode.as_ref(), code);
+                    (score <= accepted_score).then_some((score, (id, contract)))
+                } else {
+                    None
+                }
+            })
+            .min_by(|(score1, _), (score2, _)| score1.total_cmp(score2))
+            .map(|(_, data)| data)
+    }
+
+    /// Finds a contract which deployed bytecode exactly matches the given code. Accounts for link
+    /// references and immutables.
+    pub fn find_by_deployed_code_exact(&self, code: &[u8]) -> Option<ArtifactWithContractRef<'_>> {
+        // Immediately return None if the code is empty.
+        if code.is_empty() {
+            return None;
+        }
+
+        self.iter().find(|(_, contract)| {
+            let Some(deployed_bytecode) = &contract.deployed_bytecode else {
+                return false;
+            };
+            let Some(deployed_code) = &deployed_bytecode.object else {
+                return false;
+            };
+
+            let len = match deployed_code {
+                BytecodeObject::Bytecode(bytes) => bytes.len(),
+                BytecodeObject::Unlinked(bytes) => bytes.len() / 2,
+            };
+
+            if len != code.len() {
+                return false;
+            }
+
+            // Collect ignored offsets by chaining link and immutable references.
+            let mut ignored = deployed_bytecode
+                .immutable_references
+                .values()
+                .chain(deployed_bytecode.link_references.values().flat_map(|v| v.values()))
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>();
+
+            // For libraries solidity adds a call protection prefix to the bytecode. We need to
+            // ignore it as it includes library address determined at runtime.
+            // See https://docs.soliditylang.org/en/latest/contracts.html#call-protection-for-libraries and
+            // https://github.com/NomicFoundation/hardhat/blob/af7807cf38842a4f56e7f4b966b806e39631568a/packages/hardhat-verify/src/internal/solc/bytecode.ts#L172
+            let has_call_protection = match deployed_code {
+                BytecodeObject::Bytecode(bytes) => {
+                    bytes.starts_with(&CALL_PROTECTION_BYTECODE_PREFIX)
+                }
+                BytecodeObject::Unlinked(bytes) => {
+                    if let Ok(bytes) =
+                        Bytes::from_str(&bytes[..CALL_PROTECTION_BYTECODE_PREFIX.len() * 2])
+                    {
+                        bytes.starts_with(&CALL_PROTECTION_BYTECODE_PREFIX)
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if has_call_protection {
+                ignored.push(Offsets { start: 1, length: 20 });
+            }
+
+            ignored.sort_by_key(|o| o.start);
+
+            let mut left = 0;
+            for offset in ignored {
+                let right = offset.start as usize;
+
+                let matched = match deployed_code {
+                    BytecodeObject::Bytecode(bytes) => bytes[left..right] == code[left..right],
+                    BytecodeObject::Unlinked(bytes) => {
+                        if let Ok(bytes) = Bytes::from_str(&bytes[left * 2..right * 2]) {
+                            bytes == code[left..right]
+                        } else {
+                            false
+                        }
+                    }
+                };
+
+                if !matched {
+                    return false;
+                }
+
+                left = right + offset.length as usize;
+            }
+
+            if left < code.len() {
+                match deployed_code {
+                    BytecodeObject::Bytecode(bytes) => bytes[left..] == code[left..],
+                    BytecodeObject::Unlinked(bytes) => {
+                        if let Ok(bytes) = Bytes::from_str(&bytes[left * 2..]) {
+                            bytes == code[left..]
+                        } else {
+                            false
+                        }
+                    }
+                }
+            } else {
+                true
+            }
+        })
+    }
+
     /// Finds a contract which has the same contract name or identifier as `id`. If more than one is
     /// found, return error.
     pub fn find_by_name_or_identifier(
         &self,
         id: &str,
-    ) -> eyre::Result<Option<ArtifactWithContractRef>> {
+    ) -> Result<Option<ArtifactWithContractRef<'_>>> {
         let contracts = self
             .iter()
             .filter(|(artifact, _)| artifact.name == id || artifact.identifier() == id)
@@ -40,103 +290,128 @@ impl ContractsByArtifact {
             eyre::bail!("{id} has more than one implementation.");
         }
 
-        Ok(contracts.first().cloned())
+        Ok(contracts.first().copied())
     }
 
-    /// Flattens a group of contracts into maps of all events and functions
-    pub fn flatten(&self) -> (BTreeMap<[u8; 4], Function>, BTreeMap<B256, Event>, Abi) {
-        let flattened_funcs: BTreeMap<[u8; 4], Function> = self
-            .iter()
-            .flat_map(|(_name, (abi, _code))| {
-                abi.functions()
-                    .map(|func| (func.selector().into(), func.clone()))
-                    .collect::<BTreeMap<[u8; 4], Function>>()
+    /// Finds abi for contract which has the same contract name or identifier as `id`.
+    pub fn find_abi_by_name_or_identifier(&self, id: &str) -> Option<JsonAbi> {
+        self.iter()
+            .find(|(artifact, _)| {
+                artifact.name.split(".").next().unwrap() == id || artifact.identifier() == id
             })
-            .collect();
+            .map(|(_, contract)| contract.abi.clone())
+    }
 
-        let flattened_events: BTreeMap<B256, Event> = self
-            .iter()
-            .flat_map(|(_name, (abi, _code))| {
-                abi.events()
-                    .map(|event| (event.selector(), event.clone()))
-                    .collect::<BTreeMap<B256, Event>>()
+    /// Finds abi by name or source path
+    ///
+    /// Returns the abi and the contract name.
+    pub fn find_abi_by_name_or_src_path(&self, name_or_path: &str) -> Option<(JsonAbi, String)> {
+        self.iter()
+            .find(|(artifact, _)| {
+                artifact.name == name_or_path || artifact.source == PathBuf::from(name_or_path)
             })
-            .collect();
+            .map(|(_, contract)| (contract.abi.clone(), contract.name.clone()))
+    }
 
-        // We need this for better revert decoding, and want it in abi form
-        let mut errors_abi = Abi::default();
-        self.iter().for_each(|(_name, (abi, _code))| {
-            abi.errors().for_each(|error| {
-                let entry =
-                    errors_abi.errors.entry(error.name.clone()).or_insert_with(Default::default);
-                entry.push(error.clone());
-            });
-        });
-        (flattened_funcs, flattened_events, errors_abi)
+    /// Flattens the contracts into functions, events and errors.
+    pub fn flatten(&self) -> (BTreeMap<Selector, Function>, BTreeMap<B256, Event>, JsonAbi) {
+        let mut funcs = BTreeMap::new();
+        let mut events = BTreeMap::new();
+        let mut errors_abi = JsonAbi::new();
+        for (_name, contract) in self.iter() {
+            for func in contract.abi.functions() {
+                funcs.insert(func.selector(), func.clone());
+            }
+            for event in contract.abi.events() {
+                events.insert(event.selector(), event.clone());
+            }
+            for error in contract.abi.errors() {
+                errors_abi.errors.entry(error.name.clone()).or_default().push(error.clone());
+            }
+        }
+        (funcs, events, errors_abi)
+    }
+}
+
+impl From<ProjectCompileOutput> for ContractsByArtifact {
+    fn from(value: ProjectCompileOutput) -> Self {
+        Self::new(value.into_artifacts().map(|(id, ar)| {
+            (
+                id,
+                CompactContractBytecode {
+                    abi: ar.abi,
+                    bytecode: ar.bytecode,
+                    deployed_bytecode: ar.deployed_bytecode,
+                },
+            )
+        }))
     }
 }
 
 impl Deref for ContractsByArtifact {
-    type Target = BTreeMap<ArtifactId, (Abi, Vec<u8>)>;
+    type Target = BTreeMap<ArtifactId, ContractData>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl DerefMut for ContractsByArtifact {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
 /// Wrapper type that maps an address to a contract identifier and contract ABI.
-pub type ContractsByAddress = BTreeMap<Address, (String, Abi)>;
+pub type ContractsByAddress = BTreeMap<Address, (String, JsonAbi)>;
 
 /// Very simple fuzzy matching of contract bytecode.
 ///
-/// Will fail for small contracts that are essentially all immutable variables.
-pub fn diff_score(a: &[u8], b: &[u8]) -> f64 {
-    let cutoff_len = usize::min(a.len(), b.len());
-    if cutoff_len == 0 {
-        return 1.0
+/// Returns a value between `0.0` (identical) and `1.0` (completely different).
+pub fn bytecode_diff_score<'a>(mut a: &'a [u8], mut b: &'a [u8]) -> f64 {
+    // Make sure `a` is the longer one.
+    if a.len() < b.len() {
+        std::mem::swap(&mut a, &mut b);
     }
 
-    let a = &a[..cutoff_len];
-    let b = &b[..cutoff_len];
-    let mut diff_chars = 0;
-    for i in 0..cutoff_len {
-        if a[i] != b[i] {
-            diff_chars += 1;
-        }
+    // Account for different lengths.
+    let mut n_different_bytes = a.len() - b.len();
+
+    // If the difference is more than 32 bytes and more than 10% of the total length,
+    // we assume the bytecodes are completely different.
+    // This is a simple heuristic to avoid checking every byte when the lengths are very different.
+    // 32 is chosen to be a reasonable minimum as it's the size of metadata hashes and one EVM word.
+    if n_different_bytes > 32 && n_different_bytes * 10 > a.len() {
+        return 1.0;
     }
-    diff_chars as f64 / cutoff_len as f64
+
+    // Count different bytes.
+    // SAFETY: `a` is longer than `b`.
+    n_different_bytes += unsafe { count_different_bytes(a, b) };
+
+    n_different_bytes as f64 / a.len() as f64
 }
 
-/// Flattens the contracts into  (`id` -> (`Abi`, `Vec<u8>`)) pairs
-pub fn flatten_contracts(
-    contracts: &BTreeMap<ArtifactId, ContractBytecodeSome>,
-    deployed_code: bool,
-) -> ContractsByArtifact {
-    ContractsByArtifact(
-        contracts
-            .iter()
-            .filter_map(|(id, c)| {
-                let bytecode = if deployed_code {
-                    c.deployed_bytecode.clone().into_bytes()
-                } else {
-                    c.bytecode.clone().object.into_bytes()
-                };
+/// Returns the amount of different bytes between two slices.
+///
+/// # Safety
+///
+/// `a` must be at least as long as `b`.
+unsafe fn count_different_bytes(a: &[u8], b: &[u8]) -> usize {
+    // This could've been written as `std::iter::zip(a, b).filter(|(x, y)| x != y).count()`,
+    // however this function is very hot, and has been written to be as primitive as
+    // possible for lower optimization levels.
 
-                if let Some(bytecode) = bytecode {
-                    return Some((id.clone(), (c.abi.clone(), bytecode.to_vec())))
-                }
-                None
-            })
-            .collect(),
-    )
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+    let len = b.len();
+
+    let mut sum = 0;
+    let mut i = 0;
+    while i < len {
+        // SAFETY: `a` is at least as long as `b`, and `i` is in bound of `b`.
+        sum += unsafe { *a_ptr.add(i) != *b_ptr.add(i) } as usize;
+        i += 1;
+    }
+    sum
 }
 
+/// Returns contract name for a given contract identifier.
+///
 /// Artifact/Contract identifier can take the following form:
 /// `<artifact file name>:<contract name>`, the `artifact file name` is the name of the json file of
 /// the contract's artifact and the contract name is the name of the solidity contract, like
@@ -172,57 +447,8 @@ pub fn get_file_name(id: &str) -> &str {
     id.split(':').next().unwrap_or(id)
 }
 
-/// Returns the path to the json artifact depending on the input
-pub fn get_artifact_path(paths: &ProjectPathsConfig, path: &str) -> PathBuf {
-    if path.ends_with(".json") {
-        PathBuf::from(path)
-    } else {
-        let parts: Vec<&str> = path.split(':').collect();
-        let file = parts[0];
-        let contract_name =
-            if parts.len() == 1 { parts[0].replace(".sol", "") } else { parts[1].to_string() };
-        paths.artifacts.join(format!("{file}/{contract_name}.json"))
-    }
-}
-
-/// Given the transaction data tries to identify the constructor arguments
-/// The constructor data is encoded as: Constructor Code + Contract Code +  Constructor arguments
-/// decoding the arguments here with only the transaction data is not trivial here, we try to find
-/// the beginning of the constructor arguments by finding the length of the code, which is PUSH op
-/// code which holds the code size and the code starts after the invalid op code (0xfe)
-///
-/// finding the `0xfe` (invalid opcode) in the data which should mark the beginning of constructor
-/// arguments
-pub fn find_constructor_args(data: &[u8]) -> Option<&[u8]> {
-    // ref <https://ethereum.stackexchange.com/questions/126785/how-do-you-identify-the-start-of-constructor-arguments-for-contract-creation-cod>
-    static CONSTRUCTOR_CODE_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?m)(?:5b)?(?:60([a-z0-9]{2})|61([a-z0-9_]{4})|62([a-z0-9_]{6}))80(?:60([a-z0-9]{2})|61([a-z0-9_]{4})|62([a-z0-9_]{6}))(6000396000f3fe)").unwrap()
-    });
-    let s = hex::encode(data);
-
-    // we're only interested in the last occurrence which skips additional CREATE inside the
-    // constructor itself
-    let caps = CONSTRUCTOR_CODE_RE.captures_iter(&s).last()?;
-
-    let contract_len = u64::from_str_radix(
-        caps.get(1).or_else(|| caps.get(2)).or_else(|| caps.get(3))?.as_str(),
-        16,
-    )
-    .unwrap();
-
-    // the end position of the constructor code, we use this instead of the contract offset , since
-    // there could be multiple CREATE inside the data we need to divide by 2 for hex conversion
-    let constructor_end = (caps.get(7)?.end() / 2) as u64;
-    let start = (contract_len + constructor_end) as usize;
-    let args = &data[start..];
-
-    Some(args)
-}
-
 /// Helper function to convert CompactContractBytecode ~> ContractBytecodeSome
-pub fn compact_to_contract(
-    contract: CompactContractBytecode,
-) -> eyre::Result<ContractBytecodeSome> {
+pub fn compact_to_contract(contract: CompactContractBytecode) -> Result<ContractBytecodeSome> {
     Ok(ContractBytecodeSome {
         abi: contract.abi.ok_or_else(|| eyre::eyre!("No contract abi"))?,
         bytecode: contract.bytecode.ok_or_else(|| eyre::eyre!("No contract bytecode"))?.into(),
@@ -233,47 +459,112 @@ pub fn compact_to_contract(
     })
 }
 
+/// Returns the canonicalized target path for the given identifier.
+pub fn find_target_path(project: &Project, identifier: &PathOrContractInfo) -> Result<PathBuf> {
+    match identifier {
+        PathOrContractInfo::Path(path) => Ok(canonicalized(project.root().join(path))),
+        PathOrContractInfo::ContractInfo(info) => {
+            if let Some(path) = info.path.as_ref() {
+                let path = canonicalized(project.root().join(path));
+                let sources = project.sources()?;
+                let contract_path = sources
+                    .iter()
+                    .find_map(|(src_path, _)| {
+                        if **src_path == path {
+                            return Some(src_path.clone());
+                        }
+                        None
+                    })
+                    .ok_or_else(|| {
+                        eyre::eyre!(
+                            "Could not find source file for contract `{}` at {}",
+                            info.name,
+                            path.strip_prefix(project.root()).unwrap().display()
+                        )
+                    })?;
+                return Ok(contract_path);
+            }
+            // If ContractInfo.path hasn't been provided we try to find the contract using the name.
+            // This will fail if projects have multiple contracts with the same name. In that case,
+            // path must be specified.
+            let path = project.find_contract_path(&info.name)?;
+            Ok(path)
+        }
+    }
+}
+
+/// Returns the target artifact given the path and name.
+pub fn find_matching_contract_artifact(
+    output: &mut ProjectCompileOutput,
+    target_path: &Path,
+    target_name: Option<&str>,
+) -> eyre::Result<ConfigurableContractArtifact> {
+    if let Some(name) = target_name {
+        output
+            .remove(target_path, name)
+            .ok_or_eyre(format!("Could not find artifact `{name}` in the compiled artifacts"))
+    } else {
+        let possible_targets = output
+            .artifact_ids()
+            .filter(|(id, _artifact)| id.source == target_path)
+            .collect::<Vec<_>>();
+
+        if possible_targets.is_empty() {
+            eyre::bail!(
+                "Could not find artifact linked to source `{target_path:?}` in the compiled artifacts"
+            );
+        }
+
+        let (target_id, target_artifact) = possible_targets[0].clone();
+        if possible_targets.len() == 1 {
+            return Ok(target_artifact.clone());
+        }
+
+        // If all artifact_ids in `possible_targets` have the same name (without ".", indicates
+        // additional compiler profiles), it means that there are multiple contracts in the
+        // same file.
+        if !target_id.name.contains(".")
+            && possible_targets.iter().any(|(id, _)| id.name != target_id.name)
+        {
+            eyre::bail!(
+                "Multiple contracts found in the same file, please specify the target <path>:<contract> or <contract>"
+            );
+        }
+
+        // Otherwise, we're dealing with additional compiler profiles wherein `id.source` is the
+        // same but `id.path` is different.
+        let artifact = possible_targets
+            .iter()
+            .find_map(|(id, artifact)| if id.profile == "default" { Some(*artifact) } else { None })
+            .unwrap_or(target_artifact);
+
+        Ok(artifact.clone())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_dyn_abi::DynSolType;
 
-    // <https://github.com/foundry-rs/foundry/issues/3053>
     #[test]
-    fn test_find_constructor_args() {
-        let code = "6080604052348015600f57600080fd5b50604051610121380380610121833981016040819052602c91606e565b600080546001600160a01b0319166001600160a01b0396909616959095179094556001929092556002556003556004805460ff191691151591909117905560d4565b600080600080600060a08688031215608557600080fd5b85516001600160a01b0381168114609b57600080fd5b809550506020860151935060408601519250606086015191506080860151801515811460c657600080fd5b809150509295509295909350565b603f806100e26000396000f3fe6080604052600080fdfea264697066735822122089f2c61beace50d105ec1b6a56a1204301b5595e850e7576f6f3aa8e76f12d0b64736f6c6343000810003300000000000000000000000000a329c0648769a73afac7f9381e08fb43dbea720000000000000000000000000000000000000000000000000000000100000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000000b10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf60000000000000000000000000000000000000000000000000000000000000001";
+    fn bytecode_diffing() {
+        assert_eq!(bytecode_diff_score(b"a", b"a"), 0.0);
+        assert_eq!(bytecode_diff_score(b"a", b"b"), 1.0);
 
-        let code = hex::decode(code).unwrap();
+        let a_100 = &b"a".repeat(100)[..];
+        assert_eq!(bytecode_diff_score(a_100, &b"b".repeat(100)), 1.0);
+        assert_eq!(bytecode_diff_score(a_100, &b"b".repeat(99)), 1.0);
+        assert_eq!(bytecode_diff_score(a_100, &b"b".repeat(101)), 1.0);
+        assert_eq!(bytecode_diff_score(a_100, &b"b".repeat(120)), 1.0);
+        assert_eq!(bytecode_diff_score(a_100, &b"b".repeat(1000)), 1.0);
 
-        let args = find_constructor_args(&code).unwrap();
-
-        let params = DynSolType::Tuple(vec![
-            DynSolType::Address,
-            DynSolType::Uint(256),
-            DynSolType::Int(256),
-            DynSolType::FixedBytes(32),
-            DynSolType::Bool,
-        ]);
-        let _decoded = params.abi_decode_params(args).unwrap();
+        let a_99 = &b"a".repeat(99)[..];
+        assert!(bytecode_diff_score(a_100, a_99) <= 0.01);
     }
 
     #[test]
-    fn test_find_constructor_args_nested_deploy() {
-        let code = "608060405234801561001057600080fd5b5060405161066d38038061066d83398101604081905261002f9161014a565b868686868686866040516100429061007c565b610052979695949392919061022f565b604051809103906000f08015801561006e573d6000803e3d6000fd5b50505050505050505061028a565b610396806102d783390190565b634e487b7160e01b600052604160045260246000fd5b60005b838110156100ba5781810151838201526020016100a2565b50506000910152565b600082601f8301126100d457600080fd5b81516001600160401b03808211156100ee576100ee610089565b604051601f8301601f19908116603f0116810190828211818310171561011657610116610089565b8160405283815286602085880101111561012f57600080fd5b61014084602083016020890161009f565b9695505050505050565b600080600080600080600060e0888a03121561016557600080fd5b87516001600160a01b038116811461017c57600080fd5b80975050602088015195506040880151945060608801519350608088015180151581146101a857600080fd5b60a08901519093506001600160401b03808211156101c557600080fd5b6101d18b838c016100c3565b935060c08a01519150808211156101e757600080fd5b506101f48a828b016100c3565b91505092959891949750929550565b6000815180845261021b81602086016020860161009f565b601f01601f19169290920160200192915050565b60018060a01b0388168152866020820152856040820152846060820152831515608082015260e060a0820152600061026a60e0830185610203565b82810360c084015261027c8185610203565b9a9950505050505050505050565b603f806102986000396000f3fe6080604052600080fdfea264697066735822122072aeef1567521008007b956bd7c6e9101a9b49fbce1f45210fa929c79d28bd9364736f6c63430008110033608060405234801561001057600080fd5b5060405161039638038061039683398101604081905261002f91610148565b600080546001600160a01b0319166001600160a01b0389161790556001869055600285905560038490556004805460ff19168415151790556005610073838261028a565b506006610080828261028a565b5050505050505050610349565b634e487b7160e01b600052604160045260246000fd5b600082601f8301126100b457600080fd5b81516001600160401b03808211156100ce576100ce61008d565b604051601f8301601f19908116603f011681019082821181831017156100f6576100f661008d565b8160405283815260209250868385880101111561011257600080fd5b600091505b838210156101345785820183015181830184015290820190610117565b600093810190920192909252949350505050565b600080600080600080600060e0888a03121561016357600080fd5b87516001600160a01b038116811461017a57600080fd5b80975050602088015195506040880151945060608801519350608088015180151581146101a657600080fd5b60a08901519093506001600160401b03808211156101c357600080fd5b6101cf8b838c016100a3565b935060c08a01519150808211156101e557600080fd5b506101f28a828b016100a3565b91505092959891949750929550565b600181811c9082168061021557607f821691505b60208210810361023557634e487b7160e01b600052602260045260246000fd5b50919050565b601f82111561028557600081815260208120601f850160051c810160208610156102625750805b601f850160051c820191505b818110156102815782815560010161026e565b5050505b505050565b81516001600160401b038111156102a3576102a361008d565b6102b7816102b18454610201565b8461023b565b602080601f8311600181146102ec57600084156102d45750858301515b600019600386901b1c1916600185901b178555610281565b600085815260208120601f198616915b8281101561031b578886015182559484019460019091019084016102fc565b50858210156103395787850151600019600388901b60f8161c191681555b5050505050600190811b01905550565b603f806103576000396000f3fe6080604052600080fdfea2646970667358221220a468ac913d3ecf191b6559ae7dca58e05ba048434318f393b86640b25cbbf1ed64736f6c6343000811003300000000000000000000000000a329c0648769a73afac7f9381e08fb43dbea720000000000000000000000000000000000000000000000000000000100000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000000b10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf6000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000e0000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000000066162636465660000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000568656c6c6f000000000000000000000000000000000000000000000000000000";
+    fn find_by_deployed_code_exact_with_empty_deployed() {
+        let contracts = ContractsByArtifact::new(vec![]);
 
-        let code = hex::decode(code).unwrap();
-
-        let args = find_constructor_args(&code).unwrap();
-
-        let params = DynSolType::Tuple(vec![
-            DynSolType::Address,
-            DynSolType::Uint(256),
-            DynSolType::Int(256),
-            DynSolType::FixedBytes(32),
-            DynSolType::Bool,
-            DynSolType::Bytes,
-            DynSolType::String,
-        ]);
-        let _decoded = params.abi_decode_params(args).unwrap();
+        assert!(contracts.find_by_deployed_code_exact(&[]).is_none());
     }
 }

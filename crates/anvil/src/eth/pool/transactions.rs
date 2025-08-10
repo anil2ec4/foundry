@@ -1,15 +1,12 @@
 use crate::eth::{error::PoolError, util::hex_fmt_many};
-use anvil_core::eth::transaction::{PendingTransaction, TypedTransaction};
-use ethers::types::{Address, TxHash, U256};
-use parking_lot::RwLock;
-use std::{
-    cmp::Ordering,
-    collections::{BTreeSet, HashMap, HashSet},
-    fmt,
-    str::FromStr,
-    sync::Arc,
-    time::Instant,
+use alloy_network::AnyRpcTransaction;
+use alloy_primitives::{
+    Address, TxHash,
+    map::{HashMap, HashSet},
 };
+use anvil_core::eth::transaction::{PendingTransaction, TypedTransaction};
+use parking_lot::RwLock;
+use std::{cmp::Ordering, collections::BTreeSet, fmt, str::FromStr, sync::Arc, time::Instant};
 
 /// A unique identifying marker for a transaction
 pub type TxMarker = Vec<u8>;
@@ -25,7 +22,7 @@ pub fn to_marker(nonce: u64, from: Address) -> TxMarker {
 /// Modes that determine the transaction ordering of the mempool
 ///
 /// This type controls the transaction order via the priority metric of a transaction
-#[derive(Debug, Clone, Eq, PartialEq, Copy, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TransactionOrder {
     /// Keep the pool transaction transactions sorted in the order they arrive.
     ///
@@ -37,14 +34,12 @@ pub enum TransactionOrder {
     Fees,
 }
 
-// === impl TransactionOrder ===
-
 impl TransactionOrder {
     /// Returns the priority of the transactions
     pub fn priority(&self, tx: &TypedTransaction) -> TransactionPriority {
         match self {
-            TransactionOrder::Fifo => TransactionPriority::default(),
-            TransactionOrder::Fees => TransactionPriority(tx.gas_price()),
+            Self::Fifo => TransactionPriority::default(),
+            Self::Fees => TransactionPriority(tx.gas_price()),
         }
     }
 }
@@ -55,8 +50,8 @@ impl FromStr for TransactionOrder {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.to_lowercase();
         let order = match s.as_str() {
-            "fees" => TransactionOrder::Fees,
-            "fifo" => TransactionOrder::Fifo,
+            "fees" => Self::Fees,
+            "fifo" => Self::Fifo,
             _ => return Err(format!("Unknown TransactionOrder: `{s}`")),
         };
         Ok(order)
@@ -65,10 +60,10 @@ impl FromStr for TransactionOrder {
 
 /// Metric value for the priority of a transaction.
 ///
-/// The `TransactionPriority` determines the ordering of two transactions that have all  their
+/// The `TransactionPriority` determines the ordering of two transactions that have all their
 /// markers satisfied.
-#[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq, Default)]
-pub struct TransactionPriority(pub U256);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TransactionPriority(pub u128);
 
 /// Internal Transaction type
 #[derive(Clone, PartialEq, Eq)]
@@ -86,14 +81,27 @@ pub struct PoolTransaction {
 // == impl PoolTransaction ==
 
 impl PoolTransaction {
+    pub fn new(transaction: PendingTransaction) -> Self {
+        Self {
+            pending_transaction: transaction,
+            requires: vec![],
+            provides: vec![],
+            priority: TransactionPriority(0),
+        }
+    }
     /// Returns the hash of this transaction
-    pub fn hash(&self) -> &TxHash {
-        self.pending_transaction.hash()
+    pub fn hash(&self) -> TxHash {
+        *self.pending_transaction.hash()
     }
 
     /// Returns the gas pric of this transaction
-    pub fn gas_price(&self) -> U256 {
+    pub fn gas_price(&self) -> u128 {
         self.pending_transaction.transaction.gas_price()
+    }
+
+    /// Returns the type of the transaction
+    pub fn tx_type(&self) -> u8 {
+        self.pending_transaction.transaction.r#type().unwrap_or_default()
     }
 }
 
@@ -109,10 +117,23 @@ impl fmt::Debug for PoolTransaction {
     }
 }
 
+impl TryFrom<AnyRpcTransaction> for PoolTransaction {
+    type Error = eyre::Error;
+    fn try_from(value: AnyRpcTransaction) -> Result<Self, Self::Error> {
+        let typed_transaction = TypedTransaction::try_from(value)?;
+        let pending_transaction = PendingTransaction::new(typed_transaction)?;
+        Ok(Self {
+            pending_transaction,
+            requires: vec![],
+            provides: vec![],
+            priority: TransactionPriority(0),
+        })
+    }
+}
 /// A waiting pool of transaction that are pending, but not yet ready to be included in a new block.
 ///
 /// Keeps a set of transactions that are waiting for other transactions
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PendingTransactions {
     /// markers that aren't yet provided by any transaction
     required_markers: HashMap<TxMarker, HashSet<TxHash>>,
@@ -134,6 +155,13 @@ impl PendingTransactions {
         self.waiting_queue.is_empty()
     }
 
+    /// Clears internal state
+    pub fn clear(&mut self) {
+        self.required_markers.clear();
+        self.waiting_markers.clear();
+        self.waiting_queue.clear();
+    }
+
     /// Returns an iterator over all transactions in the waiting pool
     pub fn transactions(&self) -> impl Iterator<Item = Arc<PoolTransaction>> + '_ {
         self.waiting_queue.values().map(|tx| tx.transaction.clone())
@@ -143,7 +171,7 @@ impl PendingTransactions {
     pub fn add_transaction(&mut self, tx: PendingPoolTransaction) -> Result<(), PoolError> {
         assert!(!tx.is_ready(), "transaction must not be ready");
         assert!(
-            !self.waiting_queue.contains_key(tx.transaction.hash()),
+            !self.waiting_queue.contains_key(&tx.transaction.hash()),
             "transaction is already added"
         );
 
@@ -157,19 +185,19 @@ impl PendingTransactions {
                 warn!(target: "txpool", "pending replacement transaction underpriced [{:?}]", tx.transaction.hash());
                 return Err(PoolError::ReplacementUnderpriced(Box::new(
                     tx.transaction.as_ref().clone(),
-                )))
+                )));
             }
         }
 
         // add all missing markers
         for marker in &tx.missing_markers {
-            self.required_markers.entry(marker.clone()).or_default().insert(*tx.transaction.hash());
+            self.required_markers.entry(marker.clone()).or_default().insert(tx.transaction.hash());
         }
 
         // also track identifying markers
-        self.waiting_markers.insert(tx.transaction.provides.clone(), *tx.transaction.hash());
+        self.waiting_markers.insert(tx.transaction.provides.clone(), tx.transaction.hash());
         // add tx to the queue
-        self.waiting_queue.insert(*tx.transaction.hash(), tx);
+        self.waiting_queue.insert(tx.transaction.hash(), tx);
 
         Ok(())
     }
@@ -309,7 +337,7 @@ impl TransactionsIterator {
             self.independent.insert(tx_ref);
         } else {
             // otherwise we're still awaiting for some deps
-            self.awaiting.insert(*tx_ref.transaction.hash(), (satisfied, tx_ref));
+            self.awaiting.insert(tx_ref.transaction.hash(), (satisfied, tx_ref));
         }
     }
 }
@@ -324,7 +352,7 @@ impl Iterator for TransactionsIterator {
             let hash = best.transaction.hash();
 
             let ready =
-                if let Some(ready) = self.all.get(hash).cloned() { ready } else { continue };
+                if let Some(ready) = self.all.get(&hash).cloned() { ready } else { continue };
 
             // Insert transactions that just got unlocked.
             for hash in &ready.unlocks {
@@ -343,13 +371,13 @@ impl Iterator for TransactionsIterator {
                 }
             }
 
-            return Some(best.transaction)
+            return Some(best.transaction);
         }
     }
 }
 
 /// transactions that are ready to be included in a block.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ReadyTransactions {
     /// keeps track of transactions inserted in the pool
     ///
@@ -377,6 +405,13 @@ impl ReadyTransactions {
         }
     }
 
+    /// Clears the internal state
+    pub fn clear(&mut self) {
+        self.provided_markers.clear();
+        self.ready_tx.write().clear();
+        self.independent_transactions.clear();
+    }
+
     /// Returns true if the transaction is part of the queue.
     pub fn contains(&self, hash: &TxHash) -> bool {
         self.ready_tx.read().contains_key(hash)
@@ -397,26 +432,26 @@ impl ReadyTransactions {
         id
     }
 
-    /// Adds a new transactions to the ready queue
+    /// Adds a new transactions to the ready queue.
     ///
     /// # Panics
     ///
-    /// if the pending transaction is not ready: [PendingTransaction::is_ready()]
-    /// or the transaction is already included
+    /// If the pending transaction is not ready ([`PendingPoolTransaction::is_ready`])
+    /// or the transaction is already included.
     pub fn add_transaction(
         &mut self,
         tx: PendingPoolTransaction,
     ) -> Result<Vec<Arc<PoolTransaction>>, PoolError> {
         assert!(tx.is_ready(), "transaction must be ready",);
         assert!(
-            !self.ready_tx.read().contains_key(tx.transaction.hash()),
+            !self.ready_tx.read().contains_key(&tx.transaction.hash()),
             "transaction already included"
         );
 
         let (replaced_tx, unlocks) = self.replaced_transactions(&tx.transaction)?;
 
         let id = self.next_id();
-        let hash = *tx.transaction.hash();
+        let hash = tx.transaction.hash();
 
         let mut independent = true;
         let mut requires_offset = 0;
@@ -463,7 +498,7 @@ impl ReadyTransactions {
 
         // early exit if we are not replacing anything.
         if remove_hashes.is_empty() {
-            return Ok((Vec::new(), Vec::new()))
+            return Ok((Vec::new(), Vec::new()));
         }
 
         // check if we're replacing the same transaction and if it can be replaced
@@ -473,20 +508,20 @@ impl ReadyTransactions {
             // construct a list of unlocked transactions
             // also check for transactions that shouldn't be replaced because underpriced
             let ready = self.ready_tx.read();
-            for to_remove in remove_hashes.iter().filter_map(|hash| ready.get(hash)) {
+            for to_remove in remove_hashes.iter().filter_map(|hash| ready.get(*hash)) {
                 // if we're attempting to replace a transaction that provides the exact same markers
                 // (addr + nonce) then we check for gas price
                 if to_remove.provides() == tx.provides {
                     // check if underpriced
                     if tx.pending_transaction.transaction.gas_price() <= to_remove.gas_price() {
                         warn!(target: "txpool", "ready replacement transaction underpriced [{:?}]", tx.hash());
-                        return Err(PoolError::ReplacementUnderpriced(Box::new(tx.clone())))
+                        return Err(PoolError::ReplacementUnderpriced(Box::new(tx.clone())));
                     } else {
                         trace!(target: "txpool", "replacing ready transaction [{:?}] with higher gas price [{:?}]", to_remove.transaction.transaction.hash(), tx.hash());
                     }
                 }
 
-                unlocked_tx.extend(to_remove.unlocks.iter().cloned())
+                unlocked_tx.extend(to_remove.unlocks.iter().copied())
             }
         }
 
@@ -534,7 +569,7 @@ impl ReadyTransactions {
                         let prev_hash = self.provided_markers.get(marker)?;
                         let tx2 = ready.get_mut(prev_hash)?;
                         // remove hash
-                        if let Some(idx) = tx2.unlocks.iter().position(|i| i == hash) {
+                        if let Some(idx) = tx2.unlocks.iter().position(|i| i == &hash) {
                             tx2.unlocks.swap_remove(idx);
                         }
                         if tx2.unlocks.is_empty() {
@@ -566,7 +601,7 @@ impl ReadyTransactions {
                 for marker in &tx.provides {
                     let removed = self.provided_markers.remove(marker);
                     assert_eq!(
-                        removed.as_ref(),
+                        removed,
                         if current_marker == marker { None } else { Some(tx.hash()) },
                         "The pool contains exactly one transaction providing given tag; the removed transaction
 						claims to provide that tag, so it has to be mapped to it's hash; qed"
@@ -604,12 +639,11 @@ impl ReadyTransactions {
 
                 // remove from unlocks
                 for mark in &tx.transaction.transaction.requires {
-                    if let Some(hash) = self.provided_markers.get(mark) {
-                        if let Some(tx) = ready.get_mut(hash) {
-                            if let Some(idx) = tx.unlocks.iter().position(|i| i == hash) {
-                                tx.unlocks.swap_remove(idx);
-                            }
-                        }
+                    if let Some(hash) = self.provided_markers.get(mark)
+                        && let Some(tx) = ready.get_mut(hash)
+                        && let Some(idx) = tx.unlocks.iter().position(|i| i == hash)
+                    {
+                        tx.unlocks.swap_remove(idx);
                     }
                 }
 
@@ -631,7 +665,7 @@ impl ReadyTransactions {
 }
 
 /// A reference to a transaction in the pool
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct PoolTransactionRef {
     /// actual transaction
     pub transaction: Arc<PoolTransaction>,
@@ -662,7 +696,7 @@ impl Ord for PoolTransactionRef {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct ReadyTransaction {
     /// ref to the actual transaction
     pub transaction: PoolTransactionRef,
@@ -672,14 +706,12 @@ pub struct ReadyTransaction {
     pub requires_offset: usize,
 }
 
-// === impl ReadyTransaction ==
-
 impl ReadyTransaction {
     pub fn provides(&self) -> &[TxMarker] {
         &self.transaction.transaction.provides
     }
 
-    pub fn gas_price(&self) -> U256 {
+    pub fn gas_price(&self) -> u128 {
         self.transaction.transaction.gas_price()
     }
 }

@@ -10,19 +10,19 @@ pub trait CodeLocationExt {
     fn loc(&self) -> pt::Loc;
 }
 
-impl<'a, T: ?Sized + CodeLocationExt> CodeLocationExt for &'a T {
+impl<T: ?Sized + CodeLocationExt> CodeLocationExt for &T {
     fn loc(&self) -> pt::Loc {
         (**self).loc()
     }
 }
 
-impl<'a, T: ?Sized + CodeLocationExt> CodeLocationExt for &'a mut T {
+impl<T: ?Sized + CodeLocationExt> CodeLocationExt for &mut T {
     fn loc(&self) -> pt::Loc {
         (**self).loc()
     }
 }
 
-impl<'a, T: ?Sized + ToOwned + CodeLocationExt> CodeLocationExt for Cow<'a, T> {
+impl<T: ?Sized + ToOwned + CodeLocationExt> CodeLocationExt for Cow<'_, T> {
     fn loc(&self) -> pt::Loc {
         (**self).loc()
     }
@@ -90,6 +90,17 @@ impl CodeLocationExt for pt::ImportPath {
     }
 }
 
+impl CodeLocationExt for pt::VersionComparator {
+    fn loc(&self) -> pt::Loc {
+        match self {
+            Self::Plain { loc, .. }
+            | Self::Operator { loc, .. }
+            | Self::Or { loc, .. }
+            | Self::Range { loc, .. } => *loc,
+        }
+    }
+}
+
 macro_rules! impl_delegate {
     ($($t:ty),+ $(,)?) => {$(
         impl CodeLocationExt for $t {
@@ -111,6 +122,7 @@ impl_delegate! {
     pt::ErrorParameter,
     pt::EventDefinition,
     pt::EventParameter,
+    pt::PragmaDirective,
     // pt::FunctionDefinition,
     pt::HexLiteral,
     pt::Identifier,

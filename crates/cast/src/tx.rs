@@ -1,402 +1,483 @@
-use crate::errors::FunctionSignatureError;
+use crate::traces::identifier::SignaturesIdentifier;
+use alloy_consensus::{SidecarBuilder, SignableTransaction, SimpleCoder};
+use alloy_dyn_abi::ErrorExt;
+use alloy_ens::NameOrAddress;
 use alloy_json_abi::Function;
-use alloy_primitives::{Address, U256};
-use ethers_core::types::{
-    transaction::eip2718::TypedTransaction, Eip1559TransactionRequest, NameOrAddress,
-    TransactionRequest,
+use alloy_network::{
+    AnyNetwork, AnyTypedTransaction, TransactionBuilder, TransactionBuilder4844,
+    TransactionBuilder7702,
 };
-use ethers_providers::Middleware;
-use eyre::{eyre, Result};
-use foundry_common::{
-    abi::{encode_function_args, get_func, get_func_etherscan},
-    types::{ToAlloy, ToEthers},
+use alloy_primitives::{Address, Bytes, TxKind, U256, hex};
+use alloy_provider::Provider;
+use alloy_rpc_types::{AccessList, Authorization, TransactionInput, TransactionRequest};
+use alloy_serde::WithOtherFields;
+use alloy_signer::Signer;
+use alloy_transport::TransportError;
+use eyre::Result;
+use foundry_block_explorers::EtherscanApiVersion;
+use foundry_cli::{
+    opts::{CliAuthorizationList, TransactionOpts},
+    utils::{self, parse_function_args},
 };
-use foundry_config::Chain;
-use futures::future::join_all;
+use foundry_common::fmt::format_tokens;
+use foundry_config::{Chain, Config};
+use foundry_wallets::{WalletOpts, WalletSigner};
+use itertools::Itertools;
+use serde_json::value::RawValue;
+use std::fmt::Write;
 
-pub type TxBuilderOutput = (TypedTransaction, Option<Function>);
-pub type TxBuilderPeekOutput<'a> = (&'a TypedTransaction, &'a Option<Function>);
-
-/// Transaction builder
-///
-/// # Examples
-///
-/// ```
-/// # async fn foo() -> eyre::Result<()> {
-/// # use alloy_primitives::U256;
-/// # use cast::TxBuilder;
-/// # use foundry_config::NamedChain;
-/// let provider = ethers_providers::test_provider::MAINNET.provider();
-/// let mut builder =
-///     TxBuilder::new(&provider, "a.eth", Some("b.eth"), NamedChain::Mainnet, false).await?;
-/// builder.gas(Some(U256::from(1)));
-/// let (tx, _) = builder.build();
-/// # Ok(())
-/// # }
-/// ```
-pub struct TxBuilder<'a, M: Middleware> {
-    to: Option<Address>,
-    chain: Chain,
-    tx: TypedTransaction,
-    func: Option<Function>,
-    etherscan_api_key: Option<String>,
-    provider: &'a M,
+/// Different sender kinds used by [`CastTxBuilder`].
+#[expect(clippy::large_enum_variant)]
+pub enum SenderKind<'a> {
+    /// An address without signer. Used for read-only calls and transactions sent through unlocked
+    /// accounts.
+    Address(Address),
+    /// A reference to a signer.
+    Signer(&'a WalletSigner),
+    /// An owned signer.
+    OwnedSigner(WalletSigner),
 }
 
-impl<'a, M: Middleware> TxBuilder<'a, M> {
-    /// Create a new TxBuilder
-    /// `provider` - provider to use
-    /// `from` - 'from' field. Could be an ENS name
-    /// `to` - `to`. Could be a ENS
-    /// `chain` - chain to construct the tx for
-    /// `legacy` - use type 1 transaction
-    pub async fn new<F: Into<NameOrAddress>, T: Into<NameOrAddress>>(
-        provider: &'a M,
-        from: F,
-        to: Option<T>,
-        chain: impl Into<Chain>,
-        legacy: bool,
-    ) -> Result<TxBuilder<'a, M>> {
-        let chain = chain.into();
-        let from_addr = resolve_ens(provider, from).await?;
+impl SenderKind<'_> {
+    /// Resolves the name to an Ethereum Address.
+    pub fn address(&self) -> Address {
+        match self {
+            Self::Address(addr) => *addr,
+            Self::Signer(signer) => signer.address(),
+            Self::OwnedSigner(signer) => signer.address(),
+        }
+    }
 
-        let mut tx: TypedTransaction = if chain.is_legacy() || legacy {
-            TransactionRequest::new().from(from_addr.to_ethers()).chain_id(chain.id()).into()
+    /// Resolves the sender from the wallet options.
+    ///
+    /// This function prefers the `from` field and may return a different address from the
+    /// configured signer
+    /// If from is specified, returns it
+    /// If from is not specified, but there is a signer configured, returns the signer's address
+    /// If from is not specified and there is no signer configured, returns zero address
+    pub async fn from_wallet_opts(opts: WalletOpts) -> Result<Self> {
+        if let Some(from) = opts.from {
+            Ok(from.into())
+        } else if let Ok(signer) = opts.signer().await {
+            Ok(Self::OwnedSigner(signer))
         } else {
-            Eip1559TransactionRequest::new().from(from_addr.to_ethers()).chain_id(chain.id()).into()
-        };
-
-        let to_addr = if let Some(to) = to {
-            let addr = resolve_ens(provider, to).await?;
-            tx.set_to(addr.to_ethers());
-            Some(addr)
-        } else {
-            None
-        };
-        Ok(Self { to: to_addr, chain, tx, func: None, etherscan_api_key: None, provider })
-    }
-
-    /// Set gas for tx
-    pub fn set_gas(&mut self, v: U256) -> &mut Self {
-        self.tx.set_gas(v.to_ethers());
-        self
-    }
-
-    /// Set gas for tx, if `v` is not None
-    pub fn gas(&mut self, v: Option<U256>) -> &mut Self {
-        if let Some(value) = v {
-            self.set_gas(value);
+            Ok(Address::ZERO.into())
         }
-        self
     }
 
-    /// Set gas price
-    pub fn set_gas_price(&mut self, v: U256) -> &mut Self {
-        self.tx.set_gas_price(v.to_ethers());
-        self
-    }
-
-    /// Set gas price, if `v` is not None
-    pub fn gas_price(&mut self, v: Option<U256>) -> &mut Self {
-        if let Some(value) = v {
-            self.set_gas_price(value);
+    /// Returns the signer if available.
+    pub fn as_signer(&self) -> Option<&WalletSigner> {
+        match self {
+            Self::Signer(signer) => Some(signer),
+            Self::OwnedSigner(signer) => Some(signer),
+            _ => None,
         }
-        self
     }
+}
 
-    /// Set priority gas price
-    pub fn set_priority_gas_price(&mut self, v: U256) -> &mut Self {
-        if let TypedTransaction::Eip1559(tx) = &mut self.tx {
-            tx.max_priority_fee_per_gas = Some(v.to_ethers())
+impl From<Address> for SenderKind<'_> {
+    fn from(addr: Address) -> Self {
+        Self::Address(addr)
+    }
+}
+
+impl<'a> From<&'a WalletSigner> for SenderKind<'a> {
+    fn from(signer: &'a WalletSigner) -> Self {
+        Self::Signer(signer)
+    }
+}
+
+impl From<WalletSigner> for SenderKind<'_> {
+    fn from(signer: WalletSigner) -> Self {
+        Self::OwnedSigner(signer)
+    }
+}
+
+/// Prevents a misconfigured hwlib from sending a transaction that defies user-specified --from
+pub fn validate_from_address(
+    specified_from: Option<Address>,
+    signer_address: Address,
+) -> Result<()> {
+    if let Some(specified_from) = specified_from
+        && specified_from != signer_address
+    {
+        eyre::bail!(
+                "\
+The specified sender via CLI/env vars does not match the sender configured via
+the hardware wallet's HD Path.
+Please use the `--hd-path <PATH>` parameter to specify the BIP32 Path which
+corresponds to the sender, or let foundry automatically detect it by not specifying any sender address."
+            )
+    }
+    Ok(())
+}
+
+/// Initial state.
+#[derive(Debug)]
+pub struct InitState;
+
+/// State with known [TxKind].
+#[derive(Debug)]
+pub struct ToState {
+    to: Option<Address>,
+}
+
+/// State with known input for the transaction.
+#[derive(Debug)]
+pub struct InputState {
+    kind: TxKind,
+    input: Vec<u8>,
+    func: Option<Function>,
+}
+
+/// Builder type constructing [TransactionRequest] from cast send/mktx inputs.
+///
+/// It is implemented as a stateful builder with expected state transition of [InitState] ->
+/// [ToState] -> [InputState].
+#[derive(Debug)]
+pub struct CastTxBuilder<P, S> {
+    provider: P,
+    tx: WithOtherFields<TransactionRequest>,
+    /// Whether the transaction should be sent as a legacy transaction.
+    legacy: bool,
+    blob: bool,
+    auth: Option<CliAuthorizationList>,
+    chain: Chain,
+    etherscan_api_key: Option<String>,
+    etherscan_api_version: EtherscanApiVersion,
+    access_list: Option<Option<AccessList>>,
+    state: S,
+}
+
+impl<P: Provider<AnyNetwork>> CastTxBuilder<P, InitState> {
+    /// Creates a new instance of [CastTxBuilder] filling transaction with fields present in
+    /// provided [TransactionOpts].
+    pub async fn new(provider: P, tx_opts: TransactionOpts, config: &Config) -> Result<Self> {
+        let mut tx = WithOtherFields::<TransactionRequest>::default();
+
+        let chain = utils::get_chain(config.chain, &provider).await?;
+        let etherscan_api_version = config.get_etherscan_api_version(Some(chain));
+        let etherscan_api_key = config.get_etherscan_api_key(Some(chain));
+        // mark it as legacy if requested or the chain is legacy and no 7702 is provided.
+        let legacy = tx_opts.legacy || (chain.is_legacy() && tx_opts.auth.is_none());
+
+        if let Some(gas_limit) = tx_opts.gas_limit {
+            tx.set_gas_limit(gas_limit.to());
         }
-        self
-    }
 
-    /// Set priority gas price, if `v` is not None
-    pub fn priority_gas_price(&mut self, v: Option<U256>) -> &mut Self {
-        if let Some(value) = v {
-            self.set_priority_gas_price(value);
+        if let Some(value) = tx_opts.value {
+            tx.set_value(value);
         }
-        self
-    }
 
-    /// Set value
-    pub fn set_value(&mut self, v: U256) -> &mut Self {
-        self.tx.set_value(v.to_ethers());
-        self
-    }
-
-    /// Set value, if `v` is not None
-    pub fn value(&mut self, v: Option<U256>) -> &mut Self {
-        if let Some(value) = v {
-            self.set_value(value);
+        if let Some(gas_price) = tx_opts.gas_price {
+            if legacy {
+                tx.set_gas_price(gas_price.to());
+            } else {
+                tx.set_max_fee_per_gas(gas_price.to());
+            }
         }
-        self
-    }
 
-    /// Set nonce
-    pub fn set_nonce(&mut self, v: U256) -> &mut Self {
-        self.tx.set_nonce(v.to_ethers());
-        self
-    }
-
-    /// Set nonce, if `v` is not None
-    pub fn nonce(&mut self, v: Option<U256>) -> &mut Self {
-        if let Some(value) = v {
-            self.set_nonce(value);
+        if !legacy && let Some(priority_fee) = tx_opts.priority_gas_price {
+            tx.set_max_priority_fee_per_gas(priority_fee.to());
         }
-        self
-    }
 
-    /// Set etherscan API key. Used to look up function signature buy name
-    pub fn set_etherscan_api_key(&mut self, v: String) -> &mut Self {
-        self.etherscan_api_key = Some(v);
-        self
-    }
-
-    /// Set etherscan API key, if `v` is not None
-    pub fn etherscan_api_key(&mut self, v: Option<String>) -> &mut Self {
-        if let Some(value) = v {
-            self.set_etherscan_api_key(value);
+        if let Some(max_blob_fee) = tx_opts.blob_gas_price {
+            tx.set_max_fee_per_blob_gas(max_blob_fee.to())
         }
-        self
+
+        if let Some(nonce) = tx_opts.nonce {
+            tx.set_nonce(nonce.to());
+        }
+
+        Ok(Self {
+            provider,
+            tx,
+            legacy,
+            blob: tx_opts.blob,
+            chain,
+            etherscan_api_key,
+            etherscan_api_version,
+            auth: tx_opts.auth,
+            access_list: tx_opts.access_list,
+            state: InitState,
+        })
     }
 
-    pub fn set_data(&mut self, v: Vec<u8>) -> &mut Self {
-        self.tx.set_data(v.into());
-        self
+    /// Sets [TxKind] for this builder and changes state to [ToState].
+    pub async fn with_to(self, to: Option<NameOrAddress>) -> Result<CastTxBuilder<P, ToState>> {
+        let to = if let Some(to) = to { Some(to.resolve(&self.provider).await?) } else { None };
+        Ok(CastTxBuilder {
+            provider: self.provider,
+            tx: self.tx,
+            legacy: self.legacy,
+            blob: self.blob,
+            chain: self.chain,
+            etherscan_api_key: self.etherscan_api_key,
+            etherscan_api_version: self.etherscan_api_version,
+            auth: self.auth,
+            access_list: self.access_list,
+            state: ToState { to },
+        })
     }
+}
 
-    pub async fn create_args(
-        &mut self,
-        sig: &str,
+impl<P: Provider<AnyNetwork>> CastTxBuilder<P, ToState> {
+    /// Accepts user-provided code, sig and args params and constructs calldata for the transaction.
+    /// If code is present, input will be set to code + encoded constructor arguments. If no code is
+    /// present, input is set to just provided arguments.
+    pub async fn with_code_sig_and_args(
+        self,
+        code: Option<String>,
+        sig: Option<String>,
         args: Vec<String>,
-    ) -> Result<(Vec<u8>, Function)> {
-        if sig.trim().is_empty() {
-            return Err(FunctionSignatureError::MissingSignature.into())
-        }
-
-        let args = resolve_name_args(&args, self.provider).await;
-
-        let func = if sig.contains('(') {
-            // a regular function signature with parentheses
-            get_func(sig)?
-        } else if sig.starts_with("0x") {
-            // if only calldata is provided, returning a dummy function
-            get_func("x()")?
-        } else {
-            get_func_etherscan(
-                sig,
-                self.to.ok_or(FunctionSignatureError::MissingToAddress)?,
-                &args,
+    ) -> Result<CastTxBuilder<P, InputState>> {
+        let (mut args, func) = if let Some(sig) = sig {
+            parse_function_args(
+                &sig,
+                args,
+                self.state.to,
                 self.chain,
-                self.etherscan_api_key.as_ref().ok_or_else(|| {
-                    FunctionSignatureError::MissingEtherscan { sig: sig.to_string() }
-                })?,
+                &self.provider,
+                self.etherscan_api_key.as_deref(),
+                self.etherscan_api_version,
             )
             .await?
+        } else {
+            (Vec::new(), None)
         };
 
-        if sig.starts_with("0x") {
-            Ok((hex::decode(sig)?, func))
+        let input = if let Some(code) = &code {
+            let mut code = hex::decode(code)?;
+            code.append(&mut args);
+            code
         } else {
-            Ok((encode_function_args(&func, &args)?, func))
+            args
+        };
+
+        if self.state.to.is_none() && code.is_none() {
+            let has_value = self.tx.value.is_some_and(|v| !v.is_zero());
+            let has_auth = self.auth.is_some();
+            // We only allow user to omit the recipient address if transaction is an EIP-7702 tx
+            // without a value.
+            if !has_auth || has_value {
+                eyre::bail!("Must specify a recipient address or contract code to deploy");
+            }
+        }
+
+        Ok(CastTxBuilder {
+            provider: self.provider,
+            tx: self.tx,
+            legacy: self.legacy,
+            blob: self.blob,
+            chain: self.chain,
+            etherscan_api_key: self.etherscan_api_key,
+            etherscan_api_version: self.etherscan_api_version,
+            auth: self.auth,
+            access_list: self.access_list,
+            state: InputState { kind: self.state.to.into(), input, func },
+        })
+    }
+}
+
+impl<P: Provider<AnyNetwork>> CastTxBuilder<P, InputState> {
+    /// Builds [TransactionRequest] and fiils missing fields. Returns a transaction which is ready
+    /// to be broadcasted.
+    pub async fn build(
+        self,
+        sender: impl Into<SenderKind<'_>>,
+    ) -> Result<(WithOtherFields<TransactionRequest>, Option<Function>)> {
+        self._build(sender, true, false).await
+    }
+
+    /// Builds [TransactionRequest] without filling missing fields. Used for read-only calls such as
+    /// eth_call, eth_estimateGas, etc
+    pub async fn build_raw(
+        self,
+        sender: impl Into<SenderKind<'_>>,
+    ) -> Result<(WithOtherFields<TransactionRequest>, Option<Function>)> {
+        self._build(sender, false, false).await
+    }
+
+    /// Builds an unsigned RLP-encoded raw transaction.
+    ///
+    /// Returns the hex encoded string representation of the transaction.
+    pub async fn build_unsigned_raw(self, from: Address) -> Result<String> {
+        let (tx, _) = self._build(SenderKind::Address(from), true, true).await?;
+        let tx = tx.build_unsigned()?;
+        match tx {
+            AnyTypedTransaction::Ethereum(t) => Ok(hex::encode_prefixed(t.encoded_for_signing())),
+            _ => eyre::bail!("Cannot generate unsigned transaction for non-Ethereum transactions"),
         }
     }
 
-    /// Set function arguments
-    /// `sig` can be:
-    ///  * a fragment (`do(uint32,string)`)
-    ///  * selector + abi-encoded calldata
-    ///    (`0xcdba2fd40000000000000000000000000000000000000000000000000000000000007a69`)
-    ///  * only function name (`do`) - in this case, etherscan lookup is performed on `tx.to`'s
-    ///    contract
-    pub async fn set_args(
-        &mut self,
-        sig: &str,
-        args: Vec<String>,
-    ) -> Result<&mut TxBuilder<'a, M>> {
-        let (data, func) = self.create_args(sig, args).await?;
-        self.tx.set_data(data.into());
-        self.func = Some(func);
+    async fn _build(
+        mut self,
+        sender: impl Into<SenderKind<'_>>,
+        fill: bool,
+        unsigned: bool,
+    ) -> Result<(WithOtherFields<TransactionRequest>, Option<Function>)> {
+        let sender = sender.into();
+        let from = sender.address();
+
+        self.tx.set_kind(self.state.kind);
+
+        // we set both fields to the same value because some nodes only accept the legacy `data` field: <https://github.com/foundry-rs/foundry/issues/7764#issuecomment-2210453249>
+        let input = Bytes::copy_from_slice(&self.state.input);
+        self.tx.input = TransactionInput { input: Some(input.clone()), data: Some(input) };
+
+        self.tx.set_from(from);
+        self.tx.set_chain_id(self.chain.id());
+
+        let tx_nonce = if let Some(nonce) = self.tx.nonce {
+            nonce
+        } else {
+            let nonce = self.provider.get_transaction_count(from).await?;
+            if fill {
+                self.tx.nonce = Some(nonce);
+            }
+            nonce
+        };
+
+        if !unsigned {
+            self.resolve_auth(sender, tx_nonce).await?;
+        } else if self.auth.is_some() {
+            let Some(CliAuthorizationList::Signed(signed_auth)) = self.auth.take() else {
+                eyre::bail!(
+                    "SignedAuthorization needs to be provided for generating unsigned 7702 txs"
+                )
+            };
+
+            self.tx.set_authorization_list(vec![signed_auth]);
+        }
+
+        if let Some(access_list) = match self.access_list.take() {
+            None => None,
+            // --access-list provided with no value, call the provider to create it
+            Some(None) => Some(self.provider.create_access_list(&self.tx).await?.access_list),
+            // Access list provided as a string, attempt to parse it
+            Some(Some(access_list)) => Some(access_list),
+        } {
+            self.tx.set_access_list(access_list);
+        }
+
+        if !fill {
+            return Ok((self.tx, self.state.func));
+        }
+
+        if self.legacy && self.tx.gas_price.is_none() {
+            self.tx.gas_price = Some(self.provider.get_gas_price().await?);
+        }
+
+        if self.blob && self.tx.max_fee_per_blob_gas.is_none() {
+            self.tx.max_fee_per_blob_gas = Some(self.provider.get_blob_base_fee().await?)
+        }
+
+        if !self.legacy
+            && (self.tx.max_fee_per_gas.is_none() || self.tx.max_priority_fee_per_gas.is_none())
+        {
+            let estimate = self.provider.estimate_eip1559_fees().await?;
+
+            if !self.legacy {
+                if self.tx.max_fee_per_gas.is_none() {
+                    self.tx.max_fee_per_gas = Some(estimate.max_fee_per_gas);
+                }
+
+                if self.tx.max_priority_fee_per_gas.is_none() {
+                    self.tx.max_priority_fee_per_gas = Some(estimate.max_priority_fee_per_gas);
+                }
+            }
+        }
+
+        if self.tx.gas.is_none() {
+            self.estimate_gas().await?;
+        }
+
+        Ok((self.tx, self.state.func))
+    }
+
+    /// Estimate tx gas from provider call. Tries to decode custom error if execution reverted.
+    async fn estimate_gas(&mut self) -> Result<()> {
+        match self.provider.estimate_gas(self.tx.clone()).await {
+            Ok(estimated) => {
+                self.tx.gas = Some(estimated);
+                Ok(())
+            }
+            Err(err) => {
+                if let TransportError::ErrorResp(payload) = &err {
+                    // If execution reverted with code 3 during provider gas estimation then try
+                    // to decode custom errors and append it to the error message.
+                    if payload.code == 3
+                        && let Some(data) = &payload.data
+                        && let Ok(Some(decoded_error)) = decode_execution_revert(data).await
+                    {
+                        eyre::bail!("Failed to estimate gas: {}: {}", err, decoded_error)
+                    }
+                }
+                eyre::bail!("Failed to estimate gas: {}", err)
+            }
+        }
+    }
+
+    /// Parses the passed --auth value and sets the authorization list on the transaction.
+    async fn resolve_auth(&mut self, sender: SenderKind<'_>, tx_nonce: u64) -> Result<()> {
+        let Some(auth) = self.auth.take() else { return Ok(()) };
+
+        let auth = match auth {
+            CliAuthorizationList::Address(address) => {
+                let auth = Authorization {
+                    chain_id: U256::from(self.chain.id()),
+                    nonce: tx_nonce + 1,
+                    address,
+                };
+
+                let Some(signer) = sender.as_signer() else {
+                    eyre::bail!("No signer available to sign authorization");
+                };
+                let signature = signer.sign_hash(&auth.signature_hash()).await?;
+
+                auth.into_signed(signature)
+            }
+            CliAuthorizationList::Signed(auth) => auth,
+        };
+
+        self.tx.set_authorization_list(vec![auth]);
+
+        Ok(())
+    }
+}
+
+impl<P, S> CastTxBuilder<P, S>
+where
+    P: Provider<AnyNetwork>,
+{
+    pub fn with_blob_data(mut self, blob_data: Option<Vec<u8>>) -> Result<Self> {
+        let Some(blob_data) = blob_data else { return Ok(self) };
+
+        let mut coder = SidecarBuilder::<SimpleCoder>::default();
+        coder.ingest(&blob_data);
+        let sidecar = coder.build()?;
+
+        self.tx.set_blob_sidecar(sidecar);
+        self.tx.populate_blob_hashes();
+
         Ok(self)
     }
-
-    /// Set function arguments, if `value` is not None
-    pub async fn args(
-        &mut self,
-        value: Option<(&str, Vec<String>)>,
-    ) -> Result<&mut TxBuilder<'a, M>> {
-        if let Some((sig, args)) = value {
-            return self.set_args(sig, args).await
-        }
-        Ok(self)
-    }
-
-    /// Consuming build: returns typed transaction and optional function call
-    pub fn build(self) -> TxBuilderOutput {
-        (self.tx, self.func)
-    }
-
-    /// Non-consuming build: peek into the tx content
-    pub fn peek(&self) -> TxBuilderPeekOutput {
-        (&self.tx, &self.func)
-    }
 }
 
-async fn resolve_ens<M: Middleware, T: Into<NameOrAddress>>(
-    provider: &M,
-    addr: T,
-) -> Result<Address> {
-    let from_addr = match addr.into() {
-        NameOrAddress::Name(ref ens_name) => provider.resolve_name(ens_name).await,
-        NameOrAddress::Address(addr) => Ok(addr),
-    }
-    .map_err(|x| eyre!("Failed to resolve ENS name: {x}"))?;
-    Ok(from_addr.to_alloy())
-}
-
-async fn resolve_name_args<M: Middleware>(args: &[String], provider: &M) -> Vec<String> {
-    join_all(args.iter().map(|arg| async {
-        if arg.contains('.') {
-            let addr = provider.resolve_name(arg).await;
-            match addr {
-                Ok(addr) => format!("{addr:?}"),
-                Err(_) => arg.to_string(),
-            }
-        } else {
-            arg.to_string()
+/// Helper function that tries to decode custom error name and inputs from error payload data.
+async fn decode_execution_revert(data: &RawValue) -> Result<Option<String>> {
+    let err_data = serde_json::from_str::<Bytes>(data.get())?;
+    let Some(selector) = err_data.get(..4) else { return Ok(None) };
+    if let Some(known_error) =
+        SignaturesIdentifier::new(false)?.identify_error(selector.try_into().unwrap()).await
+    {
+        let mut decoded_error = known_error.name.clone();
+        if !known_error.inputs.is_empty()
+            && let Ok(error) = known_error.decode_error(&err_data)
+        {
+            write!(decoded_error, "({})", format_tokens(&error.body).format(", "))?;
         }
-    }))
-    .await
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::TxBuilder;
-    use alloy_primitives::{Address, U256};
-    use async_trait::async_trait;
-    use ethers_core::types::{transaction::eip2718::TypedTransaction, NameOrAddress, H160};
-    use ethers_providers::{JsonRpcClient, Middleware, ProviderError};
-    use foundry_common::types::ToEthers;
-    use foundry_config::NamedChain;
-    use serde::{de::DeserializeOwned, Serialize};
-    use std::str::FromStr;
-
-    const ADDR_1: &str = "0000000000000000000000000000000000000001";
-    const ADDR_2: &str = "0000000000000000000000000000000000000002";
-
-    #[derive(Debug)]
-    struct MyProvider {}
-
-    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-    impl JsonRpcClient for MyProvider {
-        type Error = ProviderError;
-
-        async fn request<T: Serialize + Send + Sync, R: DeserializeOwned>(
-            &self,
-            _method: &str,
-            _params: T,
-        ) -> Result<R, Self::Error> {
-            Err(ProviderError::CustomError("There is no request".to_string()))
-        }
+        return Ok(Some(decoded_error));
     }
-    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-    impl Middleware for MyProvider {
-        type Error = ProviderError;
-        type Provider = MyProvider;
-        type Inner = MyProvider;
-
-        fn inner(&self) -> &Self::Inner {
-            self
-        }
-
-        async fn resolve_name(&self, ens_name: &str) -> Result<H160, Self::Error> {
-            match ens_name {
-                "a.eth" => Ok(H160::from_str(ADDR_1).unwrap()),
-                "b.eth" => Ok(H160::from_str(ADDR_2).unwrap()),
-                _ => unreachable!("don't know how to resolve {ens_name}"),
-            }
-        }
-    }
-    #[tokio::test(flavor = "multi_thread")]
-    async fn builder_new_non_legacy() -> eyre::Result<()> {
-        let provider = MyProvider {};
-        let builder =
-            TxBuilder::new(&provider, "a.eth", Some("b.eth"), NamedChain::Mainnet, false).await?;
-        let (tx, args) = builder.build();
-        assert_eq!(*tx.from().unwrap(), Address::from_str(ADDR_1).unwrap().to_ethers());
-        assert_eq!(
-            *tx.to().unwrap(),
-            NameOrAddress::Address(Address::from_str(ADDR_2).unwrap().to_ethers())
-        );
-        assert_eq!(args, None);
-
-        match tx {
-            TypedTransaction::Eip1559(_) => {}
-            _ => {
-                panic!("Wrong tx type");
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn builder_new_legacy() -> eyre::Result<()> {
-        let provider = MyProvider {};
-        let builder =
-            TxBuilder::new(&provider, "a.eth", Some("b.eth"), NamedChain::Mainnet, true).await?;
-        // don't check anything other than the tx type - the rest is covered in the non-legacy case
-        let (tx, _) = builder.build();
-        match tx {
-            TypedTransaction::Legacy(_) => {}
-            _ => {
-                panic!("Wrong tx type");
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn builder_fields() -> eyre::Result<()> {
-        let provider = MyProvider {};
-        let mut builder =
-            TxBuilder::new(&provider, "a.eth", Some("b.eth"), NamedChain::Mainnet, false)
-                .await
-                .unwrap();
-        builder
-            .gas(Some(U256::from(12u32)))
-            .gas_price(Some(U256::from(34u32)))
-            .value(Some(U256::from(56u32)))
-            .nonce(Some(U256::from(78u32)));
-
-        builder.etherscan_api_key(Some(String::from("what a lovely day"))); // not testing for this :-/
-        let (tx, _) = builder.build();
-
-        assert_eq!(tx.gas().unwrap().as_u32(), 12);
-        assert_eq!(tx.gas_price().unwrap().as_u32(), 34);
-        assert_eq!(tx.value().unwrap().as_u32(), 56);
-        assert_eq!(tx.nonce().unwrap().as_u32(), 78);
-        assert_eq!(tx.chain_id().unwrap().as_u32(), 1);
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn builder_args() -> eyre::Result<()> {
-        let provider = MyProvider {};
-        let mut builder =
-            TxBuilder::new(&provider, "a.eth", Some("b.eth"), NamedChain::Mainnet, false)
-                .await
-                .unwrap();
-        builder.args(Some(("what_a_day(int)", vec![String::from("31337")]))).await?;
-        let (_, function_maybe) = builder.build();
-
-        assert_ne!(function_maybe, None);
-        let function = function_maybe.unwrap();
-        assert_eq!(function.name, String::from("what_a_day"));
-        // could test function.inputs() but that should be covered by utils's unit test
-        Ok(())
-    }
+    Ok(None)
 }

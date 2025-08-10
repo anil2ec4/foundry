@@ -1,7 +1,5 @@
-use alloy_primitives::{Sign, I256, U256};
-use ethers_core::utils::ParseUnits;
+use alloy_primitives::{I256, Sign, U256, utils::ParseUnits};
 use eyre::Result;
-use foundry_common::types::ToAlloy;
 use std::{
     convert::Infallible,
     fmt::{Binary, Debug, Display, Formatter, LowerHex, Octal, Result as FmtResult, UpperHex},
@@ -41,12 +39,12 @@ impl FromStr for Base {
             "10" | "d" | "dec" | "decimal" => Ok(Self::Decimal),
             "16" | "h" | "hex" | "hexadecimal" => Ok(Self::Hexadecimal),
             s => Err(eyre::eyre!(
-                r#"Invalid base "{}". Possible values:
-2, b, bin, binary
-8, o, oct, octal
+                "\
+Invalid base \"{s}\". Possible values:
+ 2, b, bin, binary
+ 8, o, oct, octal
 10, d, dec, decimal
-16, h, hex, hexadecimal"#,
-                s
+16, h, hex, hexadecimal"
             )),
         }
     }
@@ -92,7 +90,7 @@ impl TryFrom<U256> for Base {
 
 impl From<Base> for u32 {
     fn from(b: Base) -> Self {
-        b as u32
+        b as Self
     }
 }
 
@@ -281,8 +279,8 @@ impl From<I256> for NumberWithBase {
 impl From<ParseUnits> for NumberWithBase {
     fn from(value: ParseUnits) -> Self {
         match value {
-            ParseUnits::U256(val) => val.to_alloy().into(),
-            ParseUnits::I256(val) => val.to_alloy().into(),
+            ParseUnits::U256(val) => val.into(),
+            ParseUnits::I256(val) => val.into(),
         }
     }
 }
@@ -295,7 +293,7 @@ impl From<U256> for NumberWithBase {
 
 impl From<NumberWithBase> for I256 {
     fn from(n: NumberWithBase) -> Self {
-        I256::from_raw(n.number)
+        Self::from_raw(n.number)
     }
 }
 
@@ -386,11 +384,7 @@ impl NumberWithBase {
             }
             Base::Hexadecimal => format!("{:x}", self.number),
         };
-        if s.starts_with('0') {
-            s.trim_start_matches('0').to_string()
-        } else {
-            s
-        }
+        if s.starts_with('0') { s.trim_start_matches('0').to_string() } else { s }
     }
 
     fn _parse_int(s: &str, base: Base) -> Result<(U256, bool)> {
@@ -447,11 +441,7 @@ impl ToBase for NumberWithBase {
 
     fn to_base(&self, base: Base, add_prefix: bool) -> Result<String, Self::Err> {
         let n = self.with_base(base);
-        if add_prefix {
-            Ok(format!("{n:#?}"))
-        } else {
-            Ok(format!("{n:?}"))
-        }
+        if add_prefix { Ok(format!("{n:#?}")) } else { Ok(format!("{n:?}")) }
     }
 }
 
@@ -460,11 +450,7 @@ impl ToBase for I256 {
 
     fn to_base(&self, base: Base, add_prefix: bool) -> Result<String, Self::Err> {
         let n = NumberWithBase::from(*self).with_base(base);
-        if add_prefix {
-            Ok(format!("{n:#?}"))
-        } else {
-            Ok(format!("{n:?}"))
-        }
+        if add_prefix { Ok(format!("{n:#?}")) } else { Ok(format!("{n:?}")) }
     }
 }
 
@@ -473,11 +459,7 @@ impl ToBase for U256 {
 
     fn to_base(&self, base: Base, add_prefix: bool) -> Result<String, Self::Err> {
         let n = NumberWithBase::from(*self).with_base(base);
-        if add_prefix {
-            Ok(format!("{n:#?}"))
-        } else {
-            Ok(format!("{n:?}"))
-        }
+        if add_prefix { Ok(format!("{n:#?}")) } else { Ok(format!("{n:?}")) }
     }
 }
 
@@ -494,11 +476,7 @@ impl ToBase for str {
 
     fn to_base(&self, base: Base, add_prefix: bool) -> Result<String, Self::Err> {
         let n = NumberWithBase::from_str(self)?.with_base(base);
-        if add_prefix {
-            Ok(format!("{n:#?}"))
-        } else {
-            Ok(format!("{n:?}"))
-        }
+        if add_prefix { Ok(format!("{n:#?}")) } else { Ok(format!("{n:?}")) }
     }
 }
 
@@ -678,13 +656,20 @@ mod tests {
         }
     }
 
-    // TODO: test for octal
     #[test]
     fn test_format_neg() {
         // underlying is 256 bits so we have to pad left manually
 
         let expected_2: Vec<_> = NEG_NUM.iter().map(|n| format!("{n:1>256b}")).collect();
-        // let expected_8: Vec<_> = NEG_NUM.iter().map(|n| format!("1{:7>85o}", n)).collect();
+        let expected_8: Vec<_> = NEG_NUM
+            .iter()
+            .map(|n| {
+                let i = I256::try_from(*n).unwrap();
+                let mut u = NumberWithBase::from(i);
+                u.set_base(Octal);
+                u.format()
+            })
+            .collect();
         // Sign not included, see NumberWithBase::format
         let expected_10: Vec<_> =
             NEG_NUM.iter().map(|n| format!("{n:}").trim_matches('-').to_string()).collect();
@@ -695,7 +680,7 @@ mod tests {
             let mut num: NumberWithBase = I256::try_from(n).unwrap().into();
 
             assert_eq!(num.set_base(Binary).format(), expected_2[i]);
-            // assert_eq!(num.set_base(Octal).format(), expected_8[i]);
+            assert_eq!(num.set_base(Octal).format(), expected_8[i]);
             assert_eq!(num.set_base(Decimal).format(), expected_10[i]);
             assert_eq!(num.set_base(Hexadecimal).format(), expected_l16[i]);
             assert_eq!(num.set_base(Hexadecimal).format().to_uppercase(), expected_u16[i]);

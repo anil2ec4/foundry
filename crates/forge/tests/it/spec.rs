@@ -1,9 +1,11 @@
-use crate::config::*;
-use foundry_evm::revm::primitives::SpecId;
+//! Integration tests for EVM specifications.
+
+use crate::{config::*, test_helpers::TEST_DATA_PARIS};
 use foundry_test_utils::Filter;
+use revm::primitives::hardfork::SpecId;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_shanghai_compat() {
     let filter = Filter::new("", "ShanghaiCompat", ".*spec");
-    TestConfig::filter(filter).await.evm_spec(SpecId::SHANGHAI).run().await;
+    TestConfig::with_filter(TEST_DATA_PARIS.runner(), filter).spec_id(SpecId::SHANGHAI).run().await;
 }

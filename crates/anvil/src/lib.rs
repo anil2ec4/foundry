@@ -1,40 +1,39 @@
-#[macro_use]
-extern crate tracing;
+//! Anvil is a fast local Ethereum development node.
+
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use crate::{
     eth::{
+        EthApi,
         backend::{info::StorageInfo, mem},
         fees::{FeeHistoryService, FeeManager},
         miner::{Miner, MiningMode},
         pool::Pool,
         sign::{DevSigner, Signer as EthSigner},
-        EthApi,
     },
     filter::Filters,
     logging::{LoggingManager, NodeLogLayer},
+    server::error::{NodeError, NodeResult},
     service::NodeService,
     shutdown::Signal,
     tasks::TaskManager,
 };
+use alloy_eips::eip7840::BlobParams;
+use alloy_primitives::{Address, U256};
+use alloy_signer_local::PrivateKeySigner;
 use eth::backend::fork::ClientFork;
-use ethers::{
-    core::k256::ecdsa::SigningKey,
-    prelude::Wallet,
-    signers::Signer,
-    types::{Address, U256},
-};
-use foundry_common::{ProviderBuilder, RetryProvider};
-use foundry_evm::revm;
+use eyre::Result;
+use foundry_common::provider::{ProviderBuilder, RetryProvider};
 use futures::{FutureExt, TryFutureExt};
 use parking_lot::Mutex;
+use revm::primitives::hardfork::SpecId;
+use server::try_spawn_ipc;
 use std::{
-    future::Future,
-    io,
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
 };
 use tokio::{
     runtime::Handle,
@@ -45,20 +44,20 @@ use tokio::{
 mod service;
 
 mod config;
-pub use config::{AccountGenerator, NodeConfig, CHAIN_ID, VERSION_MESSAGE};
-mod hardfork;
-use crate::server::{
-    error::{NodeError, NodeResult},
-    spawn_ipc,
+pub use config::{
+    AccountGenerator, CHAIN_ID, DEFAULT_GAS_LIMIT, ForkChoice, NodeConfig, VERSION_MESSAGE,
 };
-pub use hardfork::Hardfork;
 
+mod hardfork;
+pub use alloy_hardforks::EthereumHardfork;
 /// ethereum related implementations
 pub mod eth;
+/// Evm related abstractions
+mod evm;
+pub use evm::{PrecompileFactory, inject_precompiles};
+
 /// support for polling filters
 pub mod filter;
-/// support for handling `genesis.json` files
-pub mod genesis;
 /// commandline output
 pub mod logging;
 /// types for subscriptions
@@ -74,33 +73,75 @@ mod tasks;
 #[cfg(feature = "cmd")]
 pub mod cmd;
 
-/// Creates the node and runs the server
+#[cfg(feature = "cmd")]
+pub mod args;
+
+#[cfg(feature = "cmd")]
+pub mod opts;
+
+#[macro_use]
+extern crate foundry_common;
+
+#[macro_use]
+extern crate tracing;
+
+/// Creates the node and runs the server.
 ///
 /// Returns the [EthApi] that can be used to interact with the node and the [JoinHandle] of the
 /// task.
 ///
-/// # Example
+/// # Panics
 ///
-/// ```rust
+/// Panics if any error occurs. For a non-panicking version, use [`try_spawn`].
+///
+///
+/// # Examples
+///
+/// ```no_run
 /// # use anvil::NodeConfig;
-/// # async fn spawn() {
+/// # async fn spawn() -> eyre::Result<()> {
 /// let config = NodeConfig::default();
 /// let (api, handle) = anvil::spawn(config).await;
 ///
 /// // use api
 ///
 /// // wait forever
-/// handle.await.unwrap();
+/// handle.await.unwrap().unwrap();
+/// # Ok(())
 /// # }
 /// ```
-pub async fn spawn(mut config: NodeConfig) -> (EthApi, NodeHandle) {
+pub async fn spawn(config: NodeConfig) -> (EthApi, NodeHandle) {
+    try_spawn(config).await.expect("failed to spawn node")
+}
+
+/// Creates the node and runs the server
+///
+/// Returns the [EthApi] that can be used to interact with the node and the [JoinHandle] of the
+/// task.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use anvil::NodeConfig;
+/// # async fn spawn() -> eyre::Result<()> {
+/// let config = NodeConfig::default();
+/// let (api, handle) = anvil::try_spawn(config).await?;
+///
+/// // use api
+///
+/// // wait forever
+/// handle.await??;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn try_spawn(mut config: NodeConfig) -> Result<(EthApi, NodeHandle)> {
     let logger = if config.enable_tracing { init_tracing() } else { Default::default() };
     logger.set_enabled(!config.silent);
 
-    let backend = Arc::new(config.setup().await);
+    let backend = Arc::new(config.setup().await?);
 
     if config.enable_auto_impersonate {
-        backend.auto_impersonate_account(true).await;
+        backend.auto_impersonate_account(true);
     }
 
     let fork = backend.get_fork();
@@ -114,13 +155,19 @@ pub async fn spawn(mut config: NodeConfig) -> (EthApi, NodeHandle) {
         no_mining,
         transaction_order,
         genesis,
+        mixed_mining,
         ..
     } = config.clone();
 
     let pool = Arc::new(Pool::default());
 
     let mode = if let Some(block_time) = block_time {
-        MiningMode::interval(block_time)
+        if mixed_mining {
+            let listener = pool.add_ready_listener();
+            MiningMode::mixed(max_transactions, listener, block_time)
+        } else {
+            MiningMode::interval(block_time)
+        }
     } else if no_mining {
         MiningMode::None
     } else {
@@ -128,27 +175,43 @@ pub async fn spawn(mut config: NodeConfig) -> (EthApi, NodeHandle) {
         let listener = pool.add_ready_listener();
         MiningMode::instant(max_transactions, listener)
     };
-    let miner = Miner::new(mode);
+
+    let miner = match &fork {
+        Some(fork) => {
+            Miner::new(mode).with_forced_transactions(fork.config.read().force_transactions.clone())
+        }
+        _ => Miner::new(mode),
+    };
 
     let dev_signer: Box<dyn EthSigner> = Box::new(DevSigner::new(signer_accounts));
     let mut signers = vec![dev_signer];
     if let Some(genesis) = genesis {
-        // include all signers from genesis.json if any
-        let genesis_signers = genesis.private_keys();
+        let genesis_signers = genesis
+            .alloc
+            .values()
+            .filter_map(|acc| acc.private_key)
+            .flat_map(|k| PrivateKeySigner::from_bytes(&k))
+            .collect::<Vec<_>>();
         if !genesis_signers.is_empty() {
-            let genesis_signers: Box<dyn EthSigner> = Box::new(DevSigner::new(genesis_signers));
-            signers.push(genesis_signers);
+            signers.push(Box::new(DevSigner::new(genesis_signers)));
         }
     }
 
-    let fees = backend.fees().clone();
     let fee_history_cache = Arc::new(Mutex::new(Default::default()));
     let fee_history_service = FeeHistoryService::new(
+        match backend.spec_id() {
+            SpecId::OSAKA => BlobParams::osaka(),
+            SpecId::PRAGUE => BlobParams::prague(),
+            _ => BlobParams::cancun(),
+        },
         backend.new_block_notifications(),
         Arc::clone(&fee_history_cache),
-        fees,
         StorageInfo::new(Arc::clone(&backend)),
     );
+    // create an entry for the best block
+    if let Some(header) = backend.get_block(backend.best_number()).map(|block| block.header) {
+        fee_history_service.insert_cache_entry_for_block(header.hash_slow(), &header);
+    }
 
     let filters = Filters::default();
 
@@ -169,25 +232,27 @@ pub async fn spawn(mut config: NodeConfig) -> (EthApi, NodeHandle) {
     let node_service =
         tokio::task::spawn(NodeService::new(pool, backend, miner, fee_history_service, filters));
 
-    let mut servers = Vec::new();
-    let mut addresses = Vec::new();
+    let mut servers = Vec::with_capacity(config.host.len());
+    let mut addresses = Vec::with_capacity(config.host.len());
 
-    for addr in config.host.iter() {
-        let sock_addr = SocketAddr::new(addr.to_owned(), port);
-        let srv = server::serve(sock_addr, api.clone(), server_config.clone());
+    for addr in &config.host {
+        let sock_addr = SocketAddr::new(*addr, port);
 
-        addresses.push(srv.local_addr());
+        // Create a TCP listener.
+        let tcp_listener = tokio::net::TcpListener::bind(sock_addr).await?;
+        addresses.push(tcp_listener.local_addr()?);
 
-        // spawn the server on a new task
-        let srv = tokio::task::spawn(srv.map_err(NodeError::from));
-        servers.push(srv);
+        // Spawn the server future on a new task.
+        let srv = server::serve_on(tcp_listener, api.clone(), server_config.clone());
+        servers.push(tokio::task::spawn(srv.map_err(Into::into)));
     }
 
     let tokio_handle = Handle::current();
     let (signal, on_shutdown) = shutdown::signal();
     let task_manager = TaskManager::new(tokio_handle, on_shutdown);
 
-    let ipc_task = config.get_ipc_path().map(|path| spawn_ipc(api.clone(), path));
+    let ipc_task =
+        config.get_ipc_path().map(|path| try_spawn_ipc(api.clone(), path)).transpose()?;
 
     let handle = NodeHandle {
         config,
@@ -199,82 +264,92 @@ pub async fn spawn(mut config: NodeConfig) -> (EthApi, NodeHandle) {
         task_manager,
     };
 
-    handle.print(fork.as_ref());
+    handle.print(fork.as_ref())?;
 
-    (api, handle)
+    Ok((api, handle))
 }
 
-type IpcTask = JoinHandle<io::Result<()>>;
+type IpcTask = JoinHandle<()>;
 
-/// A handle to the spawned node and server tasks
+/// A handle to the spawned node and server tasks.
 ///
 /// This future will resolve if either the node or server task resolve/fail.
 pub struct NodeHandle {
     config: NodeConfig,
-    /// The address of the running rpc server
+    /// The address of the running rpc server.
     addresses: Vec<SocketAddr>,
-    /// Join handle for the Node Service
+    /// Join handle for the Node Service.
     pub node_service: JoinHandle<Result<(), NodeError>>,
     /// Join handles (one per socket) for the Anvil server.
     pub servers: Vec<JoinHandle<Result<(), NodeError>>>,
-    // The future that joins the ipc server, if any
+    /// The future that joins the ipc server, if any.
     ipc_task: Option<IpcTask>,
     /// A signal that fires the shutdown, fired on drop.
     _signal: Option<Signal>,
-    /// A task manager that can be used to spawn additional tasks
+    /// A task manager that can be used to spawn additional tasks.
     task_manager: TaskManager,
 }
 
+impl Drop for NodeHandle {
+    fn drop(&mut self) {
+        // Fire shutdown signal to make sure anvil instance is terminated.
+        if let Some(signal) = self._signal.take() {
+            let _ = signal.fire();
+        }
+    }
+}
+
 impl NodeHandle {
-    /// The [NodeConfig] the node was launched with
+    /// The [NodeConfig] the node was launched with.
     pub fn config(&self) -> &NodeConfig {
         &self.config
     }
 
-    /// Prints the launch info
-    pub(crate) fn print(&self, fork: Option<&ClientFork>) {
-        self.config.print(fork);
+    /// Prints the launch info.
+    pub(crate) fn print(&self, fork: Option<&ClientFork>) -> Result<()> {
+        self.config.print(fork)?;
         if !self.config.silent {
-            println!(
+            if let Some(ipc_path) = self.ipc_path() {
+                sh_println!("IPC path: {ipc_path}")?;
+            }
+            sh_println!(
                 "Listening on {}",
                 self.addresses
                     .iter()
                     .map(|addr| { addr.to_string() })
                     .collect::<Vec<String>>()
                     .join(", ")
-            )
+            )?;
         }
+        Ok(())
     }
 
-    /// The address of the launched server
+    /// The address of the launched server.
     ///
     /// **N.B.** this may not necessarily be the same `host + port` as configured in the
-    /// `NodeConfig`, if port was set to 0, then the OS auto picks an available port
+    /// `NodeConfig`, if port was set to 0, then the OS auto picks an available port.
     pub fn socket_address(&self) -> &SocketAddr {
         &self.addresses[0]
     }
 
-    /// Returns the http endpoint
+    /// Returns the http endpoint.
     pub fn http_endpoint(&self) -> String {
         format!("http://{}", self.socket_address())
     }
 
-    /// Returns the websocket endpoint
+    /// Returns the websocket endpoint.
     pub fn ws_endpoint(&self) -> String {
         format!("ws://{}", self.socket_address())
     }
 
-    /// Returns the path of the launched ipc server, if any
+    /// Returns the path of the launched ipc server, if any.
     pub fn ipc_path(&self) -> Option<String> {
         self.config.get_ipc_path()
     }
 
     /// Constructs a [`RetryProvider`] for this handle's HTTP endpoint.
     pub fn http_provider(&self) -> RetryProvider {
-        ProviderBuilder::new(&self.http_endpoint())
-            .build()
-            .expect("failed to build HTTP provider")
-            .interval(Duration::from_millis(500))
+        ProviderBuilder::new(&self.http_endpoint()).build().expect("failed to build HTTP provider")
     }
 
     /// Constructs a [`RetryProvider`] for this handle's WS endpoint.
@@ -287,44 +362,44 @@ impl NodeHandle {
         ProviderBuilder::new(&self.config.get_ipc_path()?).build().ok()
     }
 
-    /// Signer accounts that can sign messages/transactions from the EVM node
+    /// Signer accounts that can sign messages/transactions from the EVM node.
     pub fn dev_accounts(&self) -> impl Iterator<Item = Address> + '_ {
         self.config.signer_accounts.iter().map(|wallet| wallet.address())
     }
 
-    /// Signer accounts that can sign messages/transactions from the EVM node
-    pub fn dev_wallets(&self) -> impl Iterator<Item = Wallet<SigningKey>> + '_ {
+    /// Signer accounts that can sign messages/transactions from the EVM node.
+    pub fn dev_wallets(&self) -> impl Iterator<Item = PrivateKeySigner> + '_ {
         self.config.signer_accounts.iter().cloned()
     }
 
-    /// Accounts that will be initialised with `genesis_balance` in the genesis block
+    /// Accounts that will be initialised with `genesis_balance` in the genesis block.
     pub fn genesis_accounts(&self) -> impl Iterator<Item = Address> + '_ {
         self.config.genesis_accounts.iter().map(|w| w.address())
     }
 
-    /// Native token balance of every genesis account in the genesis block
+    /// Native token balance of every genesis account in the genesis block.
     pub fn genesis_balance(&self) -> U256 {
         self.config.genesis_balance
     }
 
-    /// Default gas price for all txs
-    pub fn gas_price(&self) -> U256 {
+    /// Default gas price for all txs.
+    pub fn gas_price(&self) -> u128 {
         self.config.get_gas_price()
     }
 
-    /// Returns the shutdown signal
+    /// Returns the shutdown signal.
     pub fn shutdown_signal(&self) -> &Option<Signal> {
         &self._signal
     }
 
-    /// Returns mutable access to the shutdown signal
+    /// Returns mutable access to the shutdown signal.
     ///
-    /// This can be used to extract the Signal
+    /// This can be used to extract the Signal.
     pub fn shutdown_signal_mut(&mut self) -> &mut Option<Signal> {
         &mut self._signal
     }
 
-    /// Returns the task manager that can be used to spawn new tasks
+    /// Returns the task manager that can be used to spawn new tasks.
     ///
     /// ```
     /// use anvil::NodeHandle;
@@ -353,7 +428,7 @@ impl Future for NodeHandle {
         // poll the ipc task
         if let Some(mut ipc) = pin.ipc_task.take() {
             if let Poll::Ready(res) = ipc.poll_unpin(cx) {
-                return Poll::Ready(res.map(|res| res.map_err(NodeError::from)))
+                return Poll::Ready(res.map(|()| Ok(())));
             } else {
                 pin.ipc_task = Some(ipc);
             }
@@ -361,13 +436,13 @@ impl Future for NodeHandle {
 
         // poll the node service task
         if let Poll::Ready(res) = pin.node_service.poll_unpin(cx) {
-            return Poll::Ready(res)
+            return Poll::Ready(res);
         }
 
         // poll the axum server handles
-        for server in pin.servers.iter_mut() {
+        for server in &mut pin.servers {
             if let Poll::Ready(res) = server.poll_unpin(cx) {
-                return Poll::Ready(res)
+                return Poll::Ready(res);
             }
         }
 

@@ -7,17 +7,16 @@ use crate::prelude::{
 };
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_json_abi::EventParam;
-use alloy_primitives::{hex, Address, U256};
-use core::fmt::Debug;
+use alloy_primitives::{Address, B256, U256, hex};
 use eyre::{Result, WrapErr};
-use foundry_common::types::ToEthers;
 use foundry_compilers::Artifact;
 use foundry_evm::{
     backend::Backend, decode::decode_console_logs, executors::ExecutorBuilder,
-    inspectors::CheatsConfig,
+    inspectors::CheatsConfig, traces::TraceMode,
 };
 use solang_parser::pt::{self, CodeLocation};
 use std::str::FromStr;
+use tracing::debug;
 use yansi::Paint;
 
 const USIZE_MAX_AS_U256: U256 = U256::from_limbs([usize::MAX as u64, 0, 0, 0]);
@@ -30,6 +29,8 @@ impl SessionSource {
     ///
     /// Optionally, a tuple containing the [Address] of the deployed REPL contract as well as
     /// the [ChiselResult].
+    ///
+    /// Returns an error if compilation fails.
     pub async fn execute(&mut self) -> Result<(Address, ChiselResult)> {
         // Recompile the project and ensure no errors occurred.
         let compiled = self.build()?;
@@ -47,6 +48,20 @@ impl SessionSource {
             // Fetch the run function's body statement
             let run_func_statements = compiled.intermediate.run_func_body()?;
 
+            // Record loc of first yul block return statement (if any).
+            // This is used to decide which is the final statement within the `run()` method.
+            // see <https://github.com/foundry-rs/foundry/issues/4617>.
+            let last_yul_return = run_func_statements.iter().find_map(|statement| {
+                if let pt::Statement::Assembly { loc: _, dialect: _, flags: _, block } = statement
+                    && let Some(statement) = block.statements.last()
+                    && let pt::YulStatement::FunctionCall(yul_call) = statement
+                    && yul_call.id.name == "return"
+                {
+                    return Some(statement.loc());
+                }
+                None
+            });
+
             // Find the last statement within the "run()" method and get the program
             // counter via the source map.
             if let Some(final_statement) = run_func_statements.last() {
@@ -56,9 +71,13 @@ impl SessionSource {
                 //
                 // There is some code duplication within the arms due to the difference between
                 // the [pt::Statement] type and the [pt::YulStatement] types.
-                let source_loc = match final_statement {
+                let mut source_loc = match final_statement {
                     pt::Statement::Assembly { loc: _, dialect: _, flags: _, block } => {
-                        if let Some(statement) = block.statements.last() {
+                        // Select last non variable declaration statement, see <https://github.com/foundry-rs/foundry/issues/4938>.
+                        let last_statement = block.statements.iter().rev().find(|statement| {
+                            !matches!(statement, pt::YulStatement::VariableDeclaration(_, _, _))
+                        });
+                        if let Some(statement) = last_statement {
                             statement.loc()
                         } else {
                             // In the case where the block is empty, attempt to grab the statement
@@ -86,25 +105,32 @@ impl SessionSource {
                     _ => final_statement.loc(),
                 };
 
+                // Consider yul return statement as final statement (if it's loc is lower) .
+                if let Some(yul_return) = last_yul_return
+                    && yul_return.end() < source_loc.start()
+                {
+                    source_loc = yul_return;
+                }
+
                 // Map the source location of the final statement of the `run()` function to its
                 // corresponding runtime program counter
                 let final_pc = {
-                    let offset = source_loc.start();
-                    let length = source_loc.end() - source_loc.start();
+                    let offset = source_loc.start() as u32;
+                    let length = (source_loc.end() - source_loc.start()) as u32;
                     contract
                         .get_source_map_deployed()
                         .unwrap()
                         .unwrap()
                         .into_iter()
                         .zip(InstructionIter::new(&deployed_bytecode))
-                        .filter(|(s, _)| s.offset == offset && s.length == length)
+                        .filter(|(s, _)| s.offset() == offset && s.length() == length)
                         .map(|(_, i)| i.pc)
                         .max()
                         .unwrap_or_default()
                 };
 
                 // Create a new runner
-                let mut runner = self.prepare_runner(final_pc).await;
+                let mut runner = self.prepare_runner(final_pc).await?;
 
                 // Return [ChiselResult] or bubble up error
                 runner.run(bytecode.into_owned())
@@ -125,35 +151,41 @@ impl SessionSource {
     ///
     /// ### Returns
     ///
-    /// If the input is valid `Ok((formatted_output, continue))` where:
+    /// If the input is valid `Ok((continue, formatted_output))` where:
     /// - `continue` is true if the input should be appended to the source
-    /// - `formatted_output` is the formatted value
+    /// - `formatted_output` is the formatted value, if any
     pub async fn inspect(&self, input: &str) -> Result<(bool, Option<String>)> {
         let line = format!("bytes memory inspectoor = abi.encode({input});");
-        let mut source = match self.clone_with_new_line(line) {
+        let mut source = match self.clone_with_new_line(line.clone()) {
             Ok((source, _)) => source,
-            Err(_) => return Ok((true, None)),
+            Err(err) => {
+                debug!(%err, "failed to build new source");
+                return Ok((true, None));
+            }
         };
 
         let mut source_without_inspector = self.clone();
 
         // Events and tuples fails compilation due to it not being able to be encoded in
         // `inspectoor`. If that happens, try executing without the inspector.
-        let (mut res, has_inspector) = match source.execute().await {
-            Ok((_, res)) => (res, true),
-            Err(e) => match source_without_inspector.execute().await {
-                Ok((_, res)) => (res, false),
-                Err(_) => {
-                    if self.config.foundry_config.verbosity >= 3 {
-                        eprintln!("Could not inspect: {e}");
+        let (mut res, err) = match source.execute().await {
+            Ok((_, res)) => (res, None),
+            Err(err) => {
+                debug!(?err, %input, "execution failed");
+                match source_without_inspector.execute().await {
+                    Ok((_, res)) => (res, Some(err)),
+                    Err(_) => {
+                        if self.config.foundry_config.verbosity >= 3 {
+                            sh_err!("Could not inspect: {err}")?;
+                        }
+                        return Ok((true, None));
                     }
-                    return Ok((true, None))
                 }
-            },
+            }
         };
 
         // If abi-encoding the input failed, check whether it is an event
-        if !has_inspector {
+        if let Some(err) = err {
             let generated_output = source_without_inspector
                 .generated_output
                 .as_ref()
@@ -167,26 +199,32 @@ impl SessionSource {
 
             if let Some(event_definition) = intermediate_contract.event_definitions.get(input) {
                 let formatted = format_event_definition(event_definition)?;
-                return Ok((false, Some(formatted)))
+                return Ok((false, Some(formatted)));
             }
 
-            return Ok((false, None))
+            // we were unable to check the event
+            if self.config.foundry_config.verbosity >= 3 {
+                sh_err!("Failed eval: {err}")?;
+            }
+
+            debug!(%err, %input, "failed abi encode input");
+            return Ok((false, None));
         }
 
         let Some((stack, memory, _)) = &res.state else {
             // Show traces and logs, if there are any, and return an error
-            if let Ok(decoder) = ChiselDispatcher::decode_traces(&source.config, &mut res) {
+            if let Ok(decoder) = ChiselDispatcher::decode_traces(&source.config, &mut res).await {
                 ChiselDispatcher::show_traces(&decoder, &mut res).await?;
             }
             let decoded_logs = decode_console_logs(&res.logs);
             if !decoded_logs.is_empty() {
-                println!("{}", Paint::green("Logs:"));
+                sh_println!("{}", "Logs:".green())?;
                 for log in decoded_logs {
-                    println!("  {log}");
+                    sh_println!("  {log}")?;
                 }
             }
 
-            return Err(eyre::eyre!("Failed to inspect expression"))
+            return Err(eyre::eyre!("Failed to inspect expression"));
         };
 
         let generated_output = source
@@ -222,7 +260,7 @@ impl SessionSource {
 
         // the file compiled correctly, thus the last stack item must be the memory offset of
         // the `bytes memory inspectoor` value
-        let mut offset = stack.data().last().unwrap().to_ethers().as_usize();
+        let mut offset = stack.last().unwrap().to::<usize>();
         let mem_offset = &memory[offset..offset + 32];
         let len = U256::try_from_be_slice(mem_offset).unwrap().to::<usize>();
         offset += 32;
@@ -265,12 +303,12 @@ impl SessionSource {
     ///
     /// ### Takes
     ///
-    /// The final statement's program counter for the [ChiselInspector]
+    /// The final statement's program counter for the ChiselInspector
     ///
     /// ### Returns
     ///
     /// A configured [ChiselRunner]
-    async fn prepare_runner(&mut self, final_pc: usize) -> ChiselRunner {
+    async fn prepare_runner(&mut self, final_pc: usize) -> Result<ChiselRunner> {
         let env =
             self.config.evm_opts.evm_env().await.expect("Could not instantiate fork environment");
 
@@ -278,10 +316,8 @@ impl SessionSource {
         let backend = match self.config.backend.take() {
             Some(backend) => backend,
             None => {
-                let backend = Backend::spawn(
-                    self.config.evm_opts.get_fork(&self.config.foundry_config, env.clone()),
-                )
-                .await;
+                let fork = self.config.evm_opts.get_fork(&self.config.foundry_config, env.clone());
+                let backend = Backend::spawn(fork)?;
                 self.config.backend = Some(backend.clone());
                 backend
             }
@@ -290,120 +326,132 @@ impl SessionSource {
         // Build a new executor
         let executor = ExecutorBuilder::new()
             .inspectors(|stack| {
-                stack.chisel_state(final_pc).trace(true).cheatcodes(
-                    CheatsConfig::new(&self.config.foundry_config, self.config.evm_opts.clone())
-                        .into(),
+                stack.chisel_state(final_pc).trace_mode(TraceMode::Call).cheatcodes(
+                    CheatsConfig::new(
+                        &self.config.foundry_config,
+                        self.config.evm_opts.clone(),
+                        None,
+                        None,
+                    )
+                    .into(),
                 )
             })
             .gas_limit(self.config.evm_opts.gas_limit())
-            .spec(self.config.foundry_config.evm_spec_id())
+            .spec_id(self.config.foundry_config.evm_spec_id())
+            .legacy_assertions(self.config.foundry_config.legacy_assertions)
             .build(env, backend);
 
         // Create a [ChiselRunner] with a default balance of [U256::MAX] and
         // the sender [Address::zero].
-        ChiselRunner::new(executor, U256::MAX, Address::ZERO, self.config.calldata.clone())
+        Ok(ChiselRunner::new(executor, U256::MAX, Address::ZERO, self.config.calldata.clone()))
     }
 }
 
-/// Formats a [Token] into an inspection message
-///
-/// ### Takes
-///
-/// An owned [Token]
-///
-/// ### Returns
-///
-/// A formatted [Token] for use in inspection output.
-///
-/// TODO: Verbosity option
+/// Formats a value into an inspection message
+// TODO: Verbosity option
 fn format_token(token: DynSolValue) -> String {
     match token {
         DynSolValue::Address(a) => {
-            format!("Type: {}\n└ Data: {}", Paint::red("address"), Paint::cyan(a.to_string()))
+            format!("Type: {}\n└ Data: {}", "address".red(), a.cyan())
         }
-        DynSolValue::FixedBytes(b, _) => {
+        DynSolValue::FixedBytes(b, byte_len) => {
             format!(
                 "Type: {}\n└ Data: {}",
-                Paint::red(format!("bytes{}", b.len())),
-                Paint::cyan(hex::encode_prefixed(b))
+                format!("bytes{byte_len}").red(),
+                hex::encode_prefixed(b).cyan()
             )
         }
-        DynSolValue::Int(i, _) => {
+        DynSolValue::Int(i, bit_len) => {
             format!(
-                "Type: {}\n├ Hex: {}\n└ Decimal: {}",
-                Paint::red("int"),
-                Paint::cyan(format!("0x{i:x}")),
-                Paint::cyan(i)
+                "Type: {}\n├ Hex: {}\n├ Hex (full word): {}\n└ Decimal: {}",
+                format!("int{bit_len}").red(),
+                format!(
+                    "0x{}",
+                    format!("{i:x}")
+                        .char_indices()
+                        .skip(64 - bit_len / 4)
+                        .take(bit_len / 4)
+                        .map(|(_, c)| c)
+                        .collect::<String>()
+                )
+                .cyan(),
+                hex::encode_prefixed(B256::from(i)).cyan(),
+                i.cyan()
             )
         }
-        DynSolValue::Uint(i, _) => {
+        DynSolValue::Uint(i, bit_len) => {
             format!(
-                "Type: {}\n├ Hex: {}\n└ Decimal: {}",
-                Paint::red("uint"),
-                Paint::cyan(format!("0x{i:x}")),
-                Paint::cyan(i)
+                "Type: {}\n├ Hex: {}\n├ Hex (full word): {}\n└ Decimal: {}",
+                format!("uint{bit_len}").red(),
+                format!(
+                    "0x{}",
+                    format!("{i:x}")
+                        .char_indices()
+                        .skip(64 - bit_len / 4)
+                        .take(bit_len / 4)
+                        .map(|(_, c)| c)
+                        .collect::<String>()
+                )
+                .cyan(),
+                hex::encode_prefixed(B256::from(i)).cyan(),
+                i.cyan()
             )
         }
         DynSolValue::Bool(b) => {
-            format!("Type: {}\n└ Value: {}", Paint::red("bool"), Paint::cyan(b))
+            format!("Type: {}\n└ Value: {}", "bool".red(), b.cyan())
         }
         DynSolValue::String(_) | DynSolValue::Bytes(_) => {
             let hex = hex::encode(token.abi_encode());
             let s = token.as_str();
             format!(
                 "Type: {}\n{}├ Hex (Memory):\n├─ Length ({}): {}\n├─ Contents ({}): {}\n├ Hex (Tuple Encoded):\n├─ Pointer ({}): {}\n├─ Length ({}): {}\n└─ Contents ({}): {}",
-                Paint::red(if s.is_some() { "string" } else { "dynamic bytes" }),
+                if s.is_some() { "string" } else { "dynamic bytes" }.red(),
                 if let Some(s) = s {
-                    format!("├ UTF-8: {}\n", Paint::cyan(s))
+                    format!("├ UTF-8: {}\n", s.cyan())
                 } else {
                     String::default()
                 },
-                Paint::yellow("[0x00:0x20]"),
-                Paint::cyan(format!("0x{}", &hex[64..128])),
-                Paint::yellow("[0x20:..]"),
-                Paint::cyan(format!("0x{}", &hex[128..])),
-                Paint::yellow("[0x00:0x20]"),
-                Paint::cyan(format!("0x{}", &hex[..64])),
-                Paint::yellow("[0x20:0x40]"),
-                Paint::cyan(format!("0x{}", &hex[64..128])),
-                Paint::yellow("[0x40:..]"),
-                Paint::cyan(format!("0x{}", &hex[128..])),
+                "[0x00:0x20]".yellow(),
+                format!("0x{}", &hex[64..128]).cyan(),
+                "[0x20:..]".yellow(),
+                format!("0x{}", &hex[128..]).cyan(),
+                "[0x00:0x20]".yellow(),
+                format!("0x{}", &hex[..64]).cyan(),
+                "[0x20:0x40]".yellow(),
+                format!("0x{}", &hex[64..128]).cyan(),
+                "[0x40:..]".yellow(),
+                format!("0x{}", &hex[128..]).cyan(),
             )
         }
         DynSolValue::FixedArray(tokens) | DynSolValue::Array(tokens) => {
             let mut out = format!(
                 "{}({}) = {}",
-                Paint::red("array"),
-                Paint::yellow(format!("{}", tokens.len())),
-                Paint::red('[')
+                "array".red(),
+                format!("{}", tokens.len()).yellow(),
+                '['.red()
             );
             for token in tokens {
                 out.push_str("\n  ├ ");
                 out.push_str(&format_token(token).replace('\n', "\n  "));
                 out.push('\n');
             }
-            out.push_str(&Paint::red(']').to_string());
+            out.push_str(&']'.red().to_string());
             out
         }
         DynSolValue::Tuple(tokens) => {
             let displayed_types = tokens
                 .iter()
-                .map(|t| t.sol_type_name().to_owned())
-                .map(|t| t.unwrap_or_default().into_owned())
+                .map(|t| t.sol_type_name().unwrap_or_default())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut out = format!(
-                "{}({}) = {}",
-                Paint::red("tuple"),
-                Paint::yellow(displayed_types),
-                Paint::red('(')
-            );
+            let mut out =
+                format!("{}({}) = {}", "tuple".red(), displayed_types.yellow(), '('.red());
             for token in tokens {
                 out.push_str("\n  ├ ");
                 out.push_str(&format_token(token).replace('\n', "\n  "));
                 out.push('\n');
             }
-            out.push_str(&Paint::red(')').to_string());
+            out.push_str(&')'.red().to_string());
             out
         }
         _ => {
@@ -450,9 +498,9 @@ fn format_event_definition(event_definition: &pt::EventDefinition) -> Result<Str
         alloy_json_abi::Event { name: event_name, inputs, anonymous: event_definition.anonymous };
 
     Ok(format!(
-        "Type: {}\n├ Name: {}\n└ Signature: {:?}",
-        Paint::red("event"),
-        SolidityHelper::highlight(&format!(
+        "Type: {}\n├ Name: {}\n├ Signature: {:?}\n└ Selector: {:?}",
+        "event".red(),
+        SolidityHelper::new().highlight(&format!(
             "{}({})",
             &event.name,
             &event
@@ -471,7 +519,8 @@ fn format_event_definition(event_definition: &pt::EventDefinition) -> Result<Str
                 .collect::<Vec<_>>()
                 .join(", ")
         )),
-        Paint::cyan(event.signature()),
+        event.signature().cyan(),
+        event.selector().cyan(),
     ))
 }
 
@@ -480,7 +529,7 @@ fn format_event_definition(event_definition: &pt::EventDefinition) -> Result<Str
 // [soli](https://github.com/jpopesculian/soli)
 // =============================================
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Type {
     /// (type)
     Builtin(DynSolType),
@@ -720,7 +769,7 @@ impl Type {
                     .map(|(returns, _)| map_parameters(returns))
                     .unwrap_or_default();
                 Self::Function(
-                    Box::new(Type::Custom(vec!["__fn_type__".to_string()])),
+                    Box::new(Self::Custom(vec!["__fn_type__".to_string()])),
                     params,
                     returns,
                 )
@@ -732,9 +781,11 @@ impl Type {
     }
 
     /// Handle special expressions like [global variables](https://docs.soliditylang.org/en/latest/cheatsheet.html#global-variables)
+    ///
+    /// See: <https://github.com/ethereum/solidity/blob/81268e336573721819e39fbb3fefbc9344ad176c/libsolidity/ast/Types.cpp#L4106>
     fn map_special(self) -> Self {
         if !matches!(self, Self::Function(_, _, _) | Self::Access(_, _) | Self::Custom(_)) {
-            return self
+            return self;
         }
 
         let mut types = Vec::with_capacity(5);
@@ -743,19 +794,19 @@ impl Type {
 
         let len = types.len();
         if len == 0 {
-            return self
+            return self;
         }
 
         // Type members, like array, bytes etc
-        #[allow(clippy::single_match)]
+        #[expect(clippy::single_match)]
         match &self {
             Self::Access(inner, access) => {
                 if let Some(ty) = inner.as_ref().clone().try_as_ethabi(None) {
                     // Array / bytes members
                     let ty = Self::Builtin(ty);
                     match access.as_str() {
-                        "length" if ty.is_dynamic() || ty.is_array() => {
-                            return Self::Builtin(DynSolType::Uint(256))
+                        "length" if ty.is_dynamic() || ty.is_array() || ty.is_fixed_bytes() => {
+                            return Self::Builtin(DynSolType::Uint(256));
                         }
                         "pop" if ty.is_dynamic_array() => return ty,
                         _ => {}
@@ -781,20 +832,21 @@ impl Type {
                     match name {
                         "block" => match access {
                             "coinbase" => Some(DynSolType::Address),
-                            "basefee" | "chainid" | "difficulty" | "gaslimit" | "number" |
-                            "timestamp" => Some(DynSolType::Uint(256)),
+                            "timestamp" | "difficulty" | "prevrandao" | "number" | "gaslimit"
+                            | "chainid" | "basefee" | "blobbasefee" => Some(DynSolType::Uint(256)),
                             _ => None,
                         },
                         "msg" => match access {
-                            "data" => Some(DynSolType::Bytes),
                             "sender" => Some(DynSolType::Address),
-                            "sig" => Some(DynSolType::FixedBytes(4)),
+                            "gas" => Some(DynSolType::Uint(256)),
                             "value" => Some(DynSolType::Uint(256)),
+                            "data" => Some(DynSolType::Bytes),
+                            "sig" => Some(DynSolType::FixedBytes(4)),
                             _ => None,
                         },
                         "tx" => match access {
-                            "gasprice" => Some(DynSolType::Uint(256)),
                             "origin" => Some(DynSolType::Address),
+                            "gasprice" => Some(DynSolType::Uint(256)),
                             _ => None,
                         },
                         "abi" => match access {
@@ -809,7 +861,7 @@ impl Type {
                                         return match ty {
                                             Self::Tuple(_) => ty,
                                             ty => Self::Tuple(vec![Some(ty)]),
-                                        }
+                                        };
                                     }
                                     None => None,
                                 }
@@ -828,10 +880,11 @@ impl Type {
                             "name" => Some(DynSolType::String),
                             "creationCode" | "runtimeCode" => Some(DynSolType::Bytes),
                             "interfaceId" => Some(DynSolType::FixedBytes(4)),
-                            "min" | "max" => {
-                                let arg = args.unwrap().pop().flatten().unwrap();
-                                Some(arg.into_builtin().unwrap())
-                            }
+                            "min" | "max" => Some(
+                                // Either a builtin or an enum
+                                (|| args?.pop()??.into_builtin())()
+                                    .unwrap_or(DynSolType::Uint(256)),
+                            ),
                             _ => None,
                         },
                         "string" => match access {
@@ -861,7 +914,7 @@ impl Type {
 
     /// Recurses over itself, appending all the idents and function arguments in the order that they
     /// are found
-    fn recurse(&self, types: &mut Vec<String>, args: &mut Option<Vec<Option<Type>>>) {
+    fn recurse(&self, types: &mut Vec<String>, args: &mut Option<Vec<Option<Self>>>) {
         match self {
             Self::Builtin(ty) => types.push(ty.to_string()),
             Self::Custom(tys) => types.extend(tys.clone()),
@@ -901,7 +954,7 @@ impl Type {
             custom_type.pop();
         }
         if custom_type.is_empty() {
-            return Ok(None)
+            return Ok(None);
         }
 
         // If a contract exists with the given name, check its definitions for a match.
@@ -916,7 +969,7 @@ impl Type {
             if let Some(func) = intermediate_contract.function_definitions.get(cur_type) {
                 // Check if the custom type is a function pointer member access
                 if let res @ Some(_) = func_members(func, custom_type) {
-                    return Ok(res)
+                    return Ok(res);
                 }
 
                 // Because tuple types cannot be passed to `abi.encode`, we will only be
@@ -937,7 +990,7 @@ impl Type {
                 // struct, array, etc.
                 if let pt::Expression::Variable(ident) = return_ty {
                     custom_type.push(ident.name.clone());
-                    return Self::infer_custom_type(intermediate, custom_type, Some(contract_name))
+                    return Self::infer_custom_type(intermediate, custom_type, Some(contract_name));
                 }
 
                 // Check if our final function call alters the state. If it does, we bail so that it
@@ -969,29 +1022,31 @@ impl Type {
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Some(DynSolType::Tuple(inner_types)))
             } else {
-                eyre::bail!("Could not find any definition in contract \"{contract_name}\" for type: {custom_type:?}")
+                eyre::bail!(
+                    "Could not find any definition in contract \"{contract_name}\" for type: {custom_type:?}"
+                )
             }
         } else {
             // Check if the custom type is a variable or function within the REPL contract before
             // anything. If it is, we can stop here.
             if let Ok(res) = Self::infer_custom_type(intermediate, custom_type, Some("REPL".into()))
             {
-                return Ok(res)
+                return Ok(res);
             }
 
             // Check if the first element of the custom type is a known contract. If it is, begin
-            // our recursion on on that contract's definitions.
+            // our recursion on that contract's definitions.
             let name = custom_type.last().unwrap();
             let contract = intermediate.intermediate_contracts.get(name);
             if contract.is_some() {
                 let contract_name = custom_type.pop();
-                return Self::infer_custom_type(intermediate, custom_type, contract_name)
+                return Self::infer_custom_type(intermediate, custom_type, contract_name);
             }
 
             // See [`Type::infer_var_expr`]
             let name = custom_type.last().unwrap();
             if let Some(expr) = intermediate.repl_contract_expressions.get(name) {
-                return Self::infer_var_expr(expr, Some(intermediate), custom_type)
+                return Self::infer_var_expr(expr, Some(intermediate), custom_type);
             }
 
             // The first element of our custom type was neither a variable or a function within the
@@ -1119,7 +1174,7 @@ impl Type {
         let pt::Expression::Variable(contract_name) =
             intermediate.repl_contract_expressions.get(&contract_name.name)?
         else {
-            return None
+            return None;
         };
 
         let contract = intermediate
@@ -1128,10 +1183,10 @@ impl Type {
             .function_definitions
             .get(&function_name.name)?;
         let return_parameter = contract.as_ref().returns.first()?.to_owned().1?;
-        Type::ethabi(&return_parameter.ty, Some(intermediate)).map(|p| (contract_expr.unwrap(), p))
+        Self::ethabi(&return_parameter.ty, Some(intermediate)).map(|p| (contract_expr.unwrap(), p))
     }
 
-    /// Inverts Int to Uint and viceversa.
+    /// Inverts Int to Uint and vice-versa.
     fn invert_int(self) -> Self {
         match self {
             Self::Builtin(DynSolType::Uint(n)) => Self::Builtin(DynSolType::Int(n)),
@@ -1157,9 +1212,9 @@ impl Type {
                     Some(DynSolType::Array(inner)) | Some(DynSolType::FixedArray(inner, _)) => {
                         Some(*inner)
                     }
-                    Some(DynSolType::Bytes) | Some(DynSolType::String) => {
-                        Some(DynSolType::FixedBytes(1))
-                    }
+                    Some(DynSolType::Bytes)
+                    | Some(DynSolType::String)
+                    | Some(DynSolType::FixedBytes(_)) => Some(DynSolType::FixedBytes(1)),
                     ty => ty,
                 }
             }
@@ -1171,12 +1226,9 @@ impl Type {
     #[inline]
     fn is_dynamic(&self) -> bool {
         match self {
-            Self::Builtin(ty) => match ty {
-                // TODO: Note, this is not entirely correct. Fixed arrays of non-dynamic types are
-                // not dynamic, nor are tuples of non-dynamic types.
-                DynSolType::Bytes | DynSolType::String | DynSolType::Array(_) => true,
-                _ => false,
-            },
+            // TODO: Note, this is not entirely correct. Fixed arrays of non-dynamic types are
+            // not dynamic, nor are tuples of non-dynamic types.
+            Self::Builtin(DynSolType::Bytes | DynSolType::String | DynSolType::Array(_)) => true,
             Self::Array(_) => true,
             _ => false,
         }
@@ -1187,10 +1239,10 @@ impl Type {
     fn is_array(&self) -> bool {
         matches!(
             self,
-            Self::Array(_) |
-                Self::FixedArray(_, _) |
-                Self::Builtin(DynSolType::Array(_)) |
-                Self::Builtin(DynSolType::FixedArray(_, _))
+            Self::Array(_)
+                | Self::FixedArray(_, _)
+                | Self::Builtin(DynSolType::Array(_))
+                | Self::Builtin(DynSolType::FixedArray(_, _))
         )
     }
 
@@ -1198,6 +1250,10 @@ impl Type {
     #[inline]
     fn is_dynamic_array(&self) -> bool {
         matches!(self, Self::Array(_) | Self::Builtin(DynSolType::Array(_)))
+    }
+
+    fn is_fixed_bytes(&self) -> bool {
+        matches!(self, Self::Builtin(DynSolType::FixedBytes(_)))
     }
 }
 
@@ -1207,7 +1263,7 @@ impl Type {
 #[inline]
 fn func_members(func: &pt::FunctionDefinition, custom_type: &[String]) -> Option<DynSolType> {
     if !matches!(func.ty, pt::FunctionTy::Function) {
-        return None
+        return None;
     }
 
     let vis = func.attributes.iter().find_map(|attr| match attr {
@@ -1229,7 +1285,6 @@ fn func_members(func: &pt::FunctionDefinition, custom_type: &[String]) -> Option
 /// Whether execution should continue after inspecting this expression
 #[inline]
 fn should_continue(expr: &pt::Expression) -> bool {
-    #[allow(clippy::match_like_matches_macro)]
     match expr {
         // assignments
         pt::Expression::PreDecrement(_, _) |       // --<inner>
@@ -1320,7 +1375,7 @@ fn unit_multiplier(unit: &Option<pt::Identifier>) -> Result<U256> {
     }
 }
 
-#[derive(Clone, Copy, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Instruction {
     pub pc: usize,
     pub opcode: u8,
@@ -1339,7 +1394,7 @@ impl<'a> InstructionIter<'a> {
     }
 }
 
-impl<'a> Iterator for InstructionIter<'a> {
+impl Iterator for InstructionIter<'_> {
     type Item = Instruction;
     fn next(&mut self) -> Option<Self::Item> {
         let pc = self.offset;
@@ -1361,7 +1416,8 @@ impl<'a> Iterator for InstructionIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use foundry_compilers::{error::SolcError, Solc};
+    use foundry_compilers::{error::SolcError, solc::Solc};
+    use semver::Version;
     use std::sync::Mutex;
 
     #[test]
@@ -1537,6 +1593,8 @@ mod tests {
 
     #[test]
     fn test_global_vars() {
+        init_tracing();
+
         // https://docs.soliditylang.org/en/latest/cheatsheet.html#global-variables
         let global_variables = {
             use DynSolType::*;
@@ -1616,9 +1674,13 @@ mod tests {
                 ("type(C).runtimeCode", Bytes),
                 ("type(I).interfaceId", FixedBytes(4)),
                 ("type(uint256).min", Uint(256)),
+                ("type(int128).min", Int(128)),
                 ("type(int256).min", Int(256)),
                 ("type(uint256).max", Uint(256)),
+                ("type(int128).max", Int(128)),
                 ("type(int256).max", Int(256)),
+                ("type(Enum1).min", Uint(256)),
+                ("type(Enum1).max", Uint(256)),
                 // function
                 ("this.run.address", Address),
                 ("this.run.selector", FixedBytes(4)),
@@ -1639,28 +1701,28 @@ mod tests {
         for _ in 0..3 {
             let mut is_preinstalled = PRE_INSTALL_SOLC_LOCK.lock().unwrap();
             if !*is_preinstalled {
-                let solc = Solc::find_or_install_svm_version(version)
-                    .and_then(|solc| solc.version().map(|v| (solc, v)));
+                let solc = Solc::find_or_install(&version.parse().unwrap())
+                    .map(|solc| (solc.version.clone(), solc));
                 match solc {
-                    Ok((solc, v)) => {
+                    Ok((v, solc)) => {
                         // successfully installed
-                        eprintln!("found installed Solc v{v} @ {}", solc.solc.display());
-                        break
+                        let _ = sh_println!("found installed Solc v{v} @ {}", solc.solc.display());
+                        break;
                     }
                     Err(e) => {
                         // try reinstalling
-                        eprintln!("error while trying to re-install Solc v{version}: {e}");
+                        let _ = sh_err!("error while trying to re-install Solc v{version}: {e}");
                         let solc = Solc::blocking_install(&version.parse().unwrap());
-                        if solc.map_err(SolcError::from).and_then(|solc| solc.version()).is_ok() {
+                        if solc.map_err(SolcError::from).is_ok() {
                             *is_preinstalled = true;
-                            break
+                            break;
                         }
                     }
                 }
             }
         }
 
-        let solc = Solc::find_or_install_svm_version("0.8.19").expect("could not install solc");
+        let solc = Solc::find_or_install(&Version::new(0, 8, 19)).expect("could not install solc");
         SessionSource::new(solc, Default::default())
     }
 
@@ -1679,14 +1741,16 @@ mod tests {
             s.drain_global_code();
         }
 
-        let input = input.trim_end().trim_end_matches(';').to_string() + ";";
+        *s = s.clone_with_new_line("enum Enum1 { A }".into()).unwrap().0;
+
+        let input = format!("{};", input.trim_end().trim_end_matches(';'));
         let (mut _s, _) = s.clone_with_new_line(input).unwrap();
         *s = _s.clone();
         let s = &mut _s;
 
         if let Err(e) = s.parse() {
             for err in e {
-                eprintln!("{} @ {}:{}", err.message, err.loc.start(), err.loc.end());
+                let _ = sh_eprintln!("{}:{}: {}", err.loc.start(), err.loc.end(), err.message);
             }
             let source = s.to_repl_source();
             panic!("could not parse input:\n{source}")
@@ -1717,7 +1781,6 @@ mod tests {
         ty.and_then(|ty| ty.try_as_ethabi(Some(&intermediate)))
     }
 
-    #[track_caller]
     fn generic_type_test<'a, T, I>(s: &mut SessionSource, input: I)
     where
         T: AsRef<str> + std::fmt::Display + 'a,
@@ -1728,5 +1791,11 @@ mod tests {
             let ty = get_type_ethabi(s, input, true);
             assert_eq!(ty.as_ref(), Some(expected), "\n{input}");
         }
+    }
+
+    fn init_tracing() {
+        let _ = tracing_subscriber::FmtSubscriber::builder()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
     }
 }

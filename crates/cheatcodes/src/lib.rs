@@ -2,43 +2,68 @@
 //!
 //! Foundry cheatcodes implementations.
 
-#![warn(missing_docs, unreachable_pub, unused_crate_dependencies, rust_2018_idioms)]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![allow(elided_lifetimes_in_paths)] // Cheats context uses 3 lifetimes
 
 #[macro_use]
+extern crate foundry_common;
+
+#[macro_use]
 pub extern crate foundry_cheatcodes_spec as spec;
+
 #[macro_use]
 extern crate tracing;
 
+use alloy_evm::eth::EthEvmContext;
 use alloy_primitives::Address;
 use foundry_evm_core::backend::DatabaseExt;
-use revm::EVMData;
+use spec::Status;
 
+pub use Vm::ForgeContext;
+pub use config::CheatsConfig;
+pub use error::{Error, ErrorKind, Result};
+pub use inspector::{
+    BroadcastableTransaction, BroadcastableTransactions, Cheatcodes, CheatcodesExecutor,
+};
 pub use spec::{CheatcodeDef, Vm};
 
 #[macro_use]
 mod error;
-pub use error::{Error, ErrorKind, Result};
+
+mod base64;
 
 mod config;
-pub use config::CheatsConfig;
 
-mod inspector;
-pub use inspector::{BroadcastableTransaction, BroadcastableTransactions, Cheatcodes, Context};
+mod crypto;
+
+mod version;
 
 mod env;
-mod evm;
-mod fs;
-mod json;
-mod script;
-mod string;
-mod test;
-mod utils;
+pub use env::set_execution_context;
 
+mod evm;
+
+mod fs;
+
+mod inspector;
+
+mod json;
+
+mod script;
+pub use script::{Wallets, WalletsInner};
+
+mod string;
+
+mod test;
 pub use test::expect::ExpectedCallTracker;
 
+mod toml;
+
+mod utils;
+
 /// Cheatcode implementation.
-pub(crate) trait Cheatcode: CheatcodeDef {
+pub(crate) trait Cheatcode: CheatcodeDef + DynCheatcode {
     /// Applies this cheatcode to the given state.
     ///
     /// Implement this function if you don't need access to the EVM data.
@@ -51,57 +76,104 @@ pub(crate) trait Cheatcode: CheatcodeDef {
     ///
     /// Implement this function if you need access to the EVM data.
     #[inline(always)]
-    fn apply_full<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
+    fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         self.apply(ccx.state)
     }
 
-    #[inline]
-    fn apply_traced<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
-        let span = trace_span(self);
-        let _enter = span.enter();
-        trace_call();
-        let result = self.apply_full(ccx);
-        trace_return(&result);
-        return result;
-
-        // Separate functions to avoid inline and monomorphization bloat.
-        fn trace_span<T: Cheatcode>(cheat: &T) -> tracing::Span {
-            if enabled!(tracing::Level::TRACE) {
-                trace_span!(target: "cheatcodes", "apply", cheat=?cheat)
-            } else {
-                debug_span!(target: "cheatcodes", "apply", id=%T::CHEATCODE.func.id)
-            }
-        }
-
-        fn trace_call() {
-            trace!(target: "cheatcodes", "applying");
-        }
-
-        fn trace_return(result: &Result) {
-            trace!(
-                target: "cheatcodes",
-                return = match result {
-                    Ok(b) => hex::encode(b),
-                    Err(e) => e.to_string(),
-                }
-            );
-        }
+    /// Applies this cheatcode to the given context and executor.
+    ///
+    /// Implement this function if you need access to the executor.
+    #[inline(always)]
+    fn apply_full(&self, ccx: &mut CheatsCtxt, executor: &mut dyn CheatcodesExecutor) -> Result {
+        let _ = executor;
+        self.apply_stateful(ccx)
     }
 }
 
-/// The cheatcode context, used in [`Cheatcode`].
-pub(crate) struct CheatsCtxt<'a, 'b, 'c, DB: DatabaseExt> {
+pub(crate) trait DynCheatcode: 'static {
+    fn cheatcode(&self) -> &'static spec::Cheatcode<'static>;
+
+    fn as_debug(&self) -> &dyn std::fmt::Debug;
+
+    fn dyn_apply(&self, ccx: &mut CheatsCtxt, executor: &mut dyn CheatcodesExecutor) -> Result;
+}
+
+impl<T: Cheatcode> DynCheatcode for T {
+    #[inline]
+    fn cheatcode(&self) -> &'static spec::Cheatcode<'static> {
+        Self::CHEATCODE
+    }
+
+    #[inline]
+    fn as_debug(&self) -> &dyn std::fmt::Debug {
+        self
+    }
+
+    #[inline]
+    fn dyn_apply(&self, ccx: &mut CheatsCtxt, executor: &mut dyn CheatcodesExecutor) -> Result {
+        self.apply_full(ccx, executor)
+    }
+}
+
+impl dyn DynCheatcode {
+    pub(crate) fn name(&self) -> &'static str {
+        self.cheatcode().func.signature.split('(').next().unwrap()
+    }
+
+    pub(crate) fn id(&self) -> &'static str {
+        self.cheatcode().func.id
+    }
+
+    pub(crate) fn signature(&self) -> &'static str {
+        self.cheatcode().func.signature
+    }
+
+    pub(crate) fn status(&self) -> &Status<'static> {
+        &self.cheatcode().status
+    }
+}
+
+/// The cheatcode context, used in `Cheatcode`.
+pub struct CheatsCtxt<'cheats, 'evm, 'db, 'db2> {
     /// The cheatcodes inspector state.
-    pub(crate) state: &'a mut Cheatcodes,
+    pub(crate) state: &'cheats mut Cheatcodes,
     /// The EVM data.
-    pub(crate) data: &'b mut EVMData<'c, DB>,
+    pub(crate) ecx: &'evm mut EthEvmContext<&'db mut (dyn DatabaseExt + 'db2)>,
     /// The original `msg.sender`.
     pub(crate) caller: Address,
+    /// Gas limit of the current cheatcode call.
+    pub(crate) gas_limit: u64,
 }
 
-impl<DB: DatabaseExt> CheatsCtxt<'_, '_, '_, DB> {
+impl<'db, 'db2> std::ops::Deref for CheatsCtxt<'_, '_, 'db, 'db2> {
+    type Target = EthEvmContext<&'db mut (dyn DatabaseExt + 'db2)>;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        self.ecx
+    }
+}
+
+impl std::ops::DerefMut for CheatsCtxt<'_, '_, '_, '_> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.ecx
+    }
+}
+
+impl CheatsCtxt<'_, '_, '_, '_> {
+    #[inline]
+    pub(crate) fn ensure_not_precompile(&self, address: &Address) -> Result<()> {
+        if self.is_precompile(address) { Err(precompile_error(address)) } else { Ok(()) }
+    }
+
     #[inline]
     pub(crate) fn is_precompile(&self, address: &Address) -> bool {
-        self.data.precompiles.contains(address)
+        self.ecx.journaled_state.inner.precompiles.contains(address)
     }
+}
+
+#[cold]
+fn precompile_error(address: &Address) -> Error {
+    fmt_err!("cannot use precompile {address} as an argument")
 }

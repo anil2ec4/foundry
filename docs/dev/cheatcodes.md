@@ -6,26 +6,19 @@ manipulate the environment in which the execution is run.
 Most of the time, simply testing your smart contracts outputs isn't enough. To manipulate the state of the EVM, as well
 as test for specific reverts and events, Foundry is shipped with a set of cheatcodes.
 
-## [`revm::Inspector`](https://docs.rs/revm/3.3.0/revm/trait.Inspector.html)
+## [`revm::Inspector`](https://docs.rs/revm/latest/revm/trait.Inspector.html)
 
-To understand how cheatcodes are implemented, we first need to look at [`revm::Inspector`](https://docs.rs/revm/3.3.0/revm/trait.Inspector.html),
+To understand how cheatcodes are implemented, we first need to look at [`revm::Inspector`](https://docs.rs/revm/latest/revm/trait.Inspector.html),
 a trait that provides a set of callbacks to be notified at certain stages of EVM execution.
 
-For example, [`Inspector::call`](https://docs.rs/revm/3.3.0/revm/trait.Inspector.html#method.call)
-is called when the EVM is about to execute a call:
-
-```rust
-fn call(
-    &mut self,
-    data: &mut EVMData<'_, DB>,
-    inputs: &mut CallInputs,
-    is_static: bool,
-) -> (InstructionResult, Gas, Bytes) { ... }
-```
+For example, [`Inspector::call`](https://docs.rs/revm/latest/revm/trait.Inspector.html#method.call)
+is called when the EVM is about to execute a call and is provided with the call's inputs and the
+current state of the EVM.
 
 ## [Foundry inspectors](../../crates/evm/evm/src/inspectors/)
 
 The [`evm`](../../crates/evm/evm/) crate has a variety of inspectors for different use cases, such as
+
 - coverage
 - tracing
 - debugger
@@ -45,12 +38,7 @@ Since cheatcodes are bound to a constant address, the cheatcode inspector listen
 
 ```rust
 impl Inspector for Cheatcodes {
-    fn call(
-        &mut self,
-        data: &mut EVMData<'_, DB>,
-        call: &mut CallInputs,
-        is_static: bool,
-    ) -> (Return, Gas, Bytes) {
+    fn call(&mut self, ...) -> ... {
         if call.contract == CHEATCODE_ADDRESS {
             // intercepted cheatcode call
             // --snip--
@@ -109,27 +97,28 @@ called in the [`Cheatcodes` inspector](#cheatcode-inspector) implementation.
 Generates the raw Rust bindings for the cheatcodes, as well as lets us specify custom attributes
 individually for each item, such as functions and structs, or for entire interfaces.
 
-The way bindings are generated and extra information can be found the [`sol!`] documentation.
+The way bindings are generated and extra information can be found in the [`sol!`] documentation.
 
 We leverage this macro to apply the [`Cheatcode` derive macro](#cheatcode-derive-macro) on the `Vm` interface.
 
-### [`Cheatcode`](../../crates/macros/impl/src/cheatcodes.rs) derive macro
+### [`Cheatcode`](../../crates/macros/src/cheatcodes.rs) derive macro
 
 This is derived once on the `Vm` interface declaration, which recursively applies it to all of the
 interface's items, as well as the `sol!`-generated items, such as the `VmCalls` enum.
 
 This macro performs extra checks on functions and structs at compile time to make sure they are
 documented and have named parameters, and generates a macro which is later used to implement the
-`match { ... }` function that is be used to dispatch the cheatcode implementations after a call is
+`match { ... }` function that is to be used to dispatch the cheatcode implementations after a call is
 decoded.
 
 The latter is what fails compilation when adding a new cheatcode, and is fixed by implementing the
 [`Cheatcode` trait](#cheatcode-trait) to the newly-generated function call struct(s).
 
 The `Cheatcode` derive macro also parses the `#[cheatcode(...)]` attributes on functions, which are
-used to specify additional properties the JSON interface.
+used to specify additional properties of the JSON interface.
 
 These are all the attributes that can be specified on cheatcode functions:
+
 - `#[cheatcode(group = <ident>)]`: The group that the cheatcode belongs to. Required.
 - `#[cheatcode(status = <ident>)]`: The current status of the cheatcode. E.g. whether it is stable or experimental, etc. Defaults to `Stable`.
 - `#[cheatcode(safety = <ident>)]`: Whether the cheatcode is safe to use inside of scripts. E.g. it does not change state in an unexpected way. Defaults to the group's safety if unspecified. If the group is ambiguous, then it must be specified manually.
@@ -140,8 +129,10 @@ Multiple attributes can be specified by separating them with commas, e.g. `#[che
 
 This trait defines the interface that all cheatcode implementations must implement.
 There are two methods that can be implemented:
+
 - `apply`: implemented when the cheatcode is pure and does not need to access EVM data
-- `apply_full`: implemented when the cheatcode needs to access EVM data
+- `apply_stateful`: implemented when the cheatcode needs to access EVM data
+- `apply_full`: implemented when the cheatcode needs to access EVM data and the EVM executor itself, for example to recursively call back into the EVM to execute an arbitrary transaction
 
 Only one of these methods can be implemented.
 
@@ -164,12 +155,10 @@ update of the files.
 2. Implement the cheatcode in [`cheatcodes`] in its category's respective module. Follow the existing implementations as a guide.
 3. If a struct, enum, error, or event was added to `Vm`, update [`spec::Cheatcodes::new`]
 4. Update the JSON interface by running `cargo cheats` twice. This is expected to fail the first time that this is run after adding a new cheatcode; see [JSON interface](#json-interface)
-5. Write an integration test for the cheatcode in [`testdata/cheats/`]
-6. Submit a PR to [`forge-std`] updating the Solidity interfaces as necessary. Note that this step won't be necessary once the Solidity interfaces are generated using the JSON interface
+5. Write an integration test for the cheatcode in [`testdata/default/cheats/`]
 
 [`sol!`]: https://docs.rs/alloy-sol-macro/latest/alloy_sol_macro/macro.sol.html
 [`cheatcodes/spec/src/vm.rs`]: ../../crates/cheatcodes/spec/src/vm.rs
 [`cheatcodes`]: ../../crates/cheatcodes/
 [`spec::Cheatcodes::new`]: ../../crates/cheatcodes/spec/src/lib.rs#L74
-[`testdata/cheats/`]: ../../testdata/cheats/
-[`forge-std`]: https://github.com/foundry-rs/forge-std
+[`testdata/cheats/`]: ../../testdata/default/cheats/

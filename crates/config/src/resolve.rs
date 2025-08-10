@@ -1,15 +1,14 @@
 //! Helper for resolving env vars
 
-use once_cell::sync::Lazy;
 use regex::Regex;
-use std::{env, env::VarError, fmt};
+use std::{env, env::VarError, fmt, sync::LazyLock};
 
 /// A regex that matches `${val}` placeholders
-pub static RE_PLACEHOLDER: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)(?P<outer>\$\{\s*(?P<inner>.*?)\s*})").unwrap());
+pub static RE_PLACEHOLDER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)(?P<outer>\$\{\s*(?P<inner>.*?)\s*})").unwrap());
 
 /// Error when we failed to resolve an env var
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnresolvedEnvVarError {
     /// The unresolved input string
     pub unresolved: String,
@@ -19,22 +18,28 @@ pub struct UnresolvedEnvVarError {
     pub source: VarError,
 }
 
-// === impl UnresolvedEnvVarError ===
-
 impl UnresolvedEnvVarError {
     /// Tries to resolve a value
-    pub fn try_resolve(&self) -> Result<String, UnresolvedEnvVarError> {
+    pub fn try_resolve(&self) -> Result<String, Self> {
         interpolate(&self.unresolved)
+    }
+
+    fn is_simple(&self) -> bool {
+        RE_PLACEHOLDER.captures_iter(&self.unresolved).count() <= 1
     }
 }
 
 impl fmt::Display for UnresolvedEnvVarError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Failed to resolve env var `{}` in `{}`: {}",
-            self.var, self.unresolved, self.source
-        )
+        write!(f, "environment variable `{}` ", self.var)?;
+        f.write_str(match self.source {
+            VarError::NotPresent => "not found",
+            VarError::NotUnicode(_) => "is not valid unicode",
+        })?;
+        if !self.is_simple() {
+            write!(f, " in `{}`", self.unresolved)?;
+        }
+        Ok(())
     }
 }
 

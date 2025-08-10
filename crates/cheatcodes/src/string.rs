@@ -1,7 +1,8 @@
-//! Implementations of [`String`](crate::Group::String) cheatcodes.
+//! Implementations of [`String`](spec::Group::String) cheatcodes.
 
 use crate::{Cheatcode, Cheatcodes, Result, Vm::*};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
+use alloy_primitives::{U256, hex};
 use alloy_sol_types::SolValue;
 
 // address
@@ -16,7 +17,7 @@ impl Cheatcode for toString_0Call {
 impl Cheatcode for toString_1Call {
     fn apply(&self, _state: &mut Cheatcodes) -> Result {
         let Self { value } = self;
-        Ok(hex::encode_prefixed(value).abi_encode())
+        Ok(value.to_string().abi_encode())
     }
 }
 
@@ -94,6 +95,56 @@ impl Cheatcode for parseBoolCall {
     }
 }
 
+impl Cheatcode for toLowercaseCall {
+    fn apply(&self, _state: &mut Cheatcodes) -> Result {
+        let Self { input } = self;
+        Ok(input.to_lowercase().abi_encode())
+    }
+}
+
+impl Cheatcode for toUppercaseCall {
+    fn apply(&self, _state: &mut Cheatcodes) -> Result {
+        let Self { input } = self;
+        Ok(input.to_uppercase().abi_encode())
+    }
+}
+
+impl Cheatcode for trimCall {
+    fn apply(&self, _state: &mut Cheatcodes) -> Result {
+        let Self { input } = self;
+        Ok(input.trim().abi_encode())
+    }
+}
+
+impl Cheatcode for replaceCall {
+    fn apply(&self, _state: &mut Cheatcodes) -> Result {
+        let Self { input, from, to } = self;
+        Ok(input.replace(from, to).abi_encode())
+    }
+}
+
+impl Cheatcode for splitCall {
+    fn apply(&self, _state: &mut Cheatcodes) -> Result {
+        let Self { input, delimiter } = self;
+        let parts: Vec<&str> = input.split(delimiter).collect();
+        Ok(parts.abi_encode())
+    }
+}
+
+impl Cheatcode for indexOfCall {
+    fn apply(&self, _state: &mut Cheatcodes) -> Result {
+        let Self { input, key } = self;
+        Ok(input.find(key).map(U256::from).unwrap_or(U256::MAX).abi_encode())
+    }
+}
+
+impl Cheatcode for containsCall {
+    fn apply(&self, _state: &mut Cheatcodes) -> Result {
+        let Self { subject, search } = self;
+        Ok(subject.contains(search).abi_encode())
+    }
+}
+
 pub(super) fn parse(s: &str, ty: &DynSolType) -> Result {
     parse_value(s, ty).map(|v| v.abi_encode())
 }
@@ -116,7 +167,7 @@ where
 }
 
 #[instrument(target = "cheatcodes", level = "debug", skip(ty), fields(%ty), ret)]
-fn parse_value(s: &str, ty: &DynSolType) -> Result<DynSolValue> {
+pub(super) fn parse_value(s: &str, ty: &DynSolType) -> Result<DynSolValue> {
     match ty.coerce_str(s) {
         Ok(value) => Ok(value),
         Err(e) => match parse_value_fallback(s, ty) {
@@ -140,12 +191,12 @@ fn parse_value_fallback(s: &str, ty: &DynSolType) -> Option<Result<DynSolValue, 
             };
             return Some(Ok(DynSolValue::Bool(b)));
         }
-        DynSolType::Int(_) |
-        DynSolType::Uint(_) |
-        DynSolType::FixedBytes(_) |
-        DynSolType::Bytes => {
-            if !s.starts_with("0x") && s.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some(Err("missing hex prefix (\"0x\") for hex string"))
+        DynSolType::Int(_)
+        | DynSolType::Uint(_)
+        | DynSolType::FixedBytes(_)
+        | DynSolType::Bytes => {
+            if !s.starts_with("0x") && hex::check_raw(s) {
+                return Some(Err("missing hex prefix (\"0x\") for hex string"));
             }
         }
         _ => {}

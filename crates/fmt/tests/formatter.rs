@@ -1,4 +1,4 @@
-use forge_fmt::{format_to, parse, solang_ext::AstEq, FormatterConfig};
+use forge_fmt::{FormatterConfig, format_to, parse, solang_ext::AstEq};
 use itertools::Itertools;
 use std::{fs, path::PathBuf};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -11,7 +11,7 @@ fn tracing() {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
-fn test_directory(base_name: &str) {
+fn test_directory(base_name: &str, test_config: TestConfig) {
     tracing();
     let mut original = None;
 
@@ -60,7 +60,7 @@ fn test_directory(base_name: &str) {
                             .try_into()
                             .unwrap_or_else(|err| panic!("Invalid config for {filename}: {err}"));
 
-                        return Some((filename.to_string(), config, lines.join("\n")))
+                        return Some((filename.to_string(), config, lines.join("\n")));
                     }
                 }
 
@@ -74,6 +74,7 @@ fn test_directory(base_name: &str) {
             config,
             original.as_ref().expect("original.sol not found"),
             &formatted,
+            test_config,
         );
     }
 }
@@ -82,12 +83,18 @@ fn assert_eof(content: &str) {
     assert!(content.ends_with('\n') && !content.ends_with("\n\n"));
 }
 
-fn test_formatter(filename: &str, config: FormatterConfig, source: &str, expected_source: &str) {
+fn test_formatter(
+    filename: &str,
+    config: FormatterConfig,
+    source: &str,
+    expected_source: &str,
+    test_config: TestConfig,
+) {
     #[derive(Eq)]
     struct PrettyString(String);
 
     impl PartialEq for PrettyString {
-        fn eq(&self, other: &PrettyString) -> bool {
+        fn eq(&self, other: &Self) -> bool {
             self.0.lines().eq(other.0.lines())
         }
     }
@@ -100,11 +107,17 @@ fn test_formatter(filename: &str, config: FormatterConfig, source: &str, expecte
 
     assert_eof(expected_source);
 
-    let source_parsed = parse(source).unwrap();
-    let expected_parsed = parse(expected_source).unwrap();
+    let source_parsed = match parse(source) {
+        Ok(p) => p,
+        Err(e) => panic!("{e}"),
+    };
+    let expected_parsed = match parse(expected_source) {
+        Ok(p) => p,
+        Err(e) => panic!("{e}"),
+    };
 
-    if !source_parsed.pt.ast_eq(&expected_parsed.pt) {
-        pretty_assertions::assert_eq!(
+    if !test_config.skip_compare_ast_eq && !source_parsed.pt.ast_eq(&expected_parsed.pt) {
+        similar_asserts::assert_eq!(
             source_parsed.pt,
             expected_parsed.pt,
             "(formatted Parse Tree == expected Parse Tree) in {}",
@@ -118,10 +131,9 @@ fn test_formatter(filename: &str, config: FormatterConfig, source: &str, expecte
     format_to(&mut source_formatted, source_parsed, config.clone()).unwrap();
     assert_eof(&source_formatted);
 
-    // println!("{}", source_formatted);
     let source_formatted = PrettyString(source_formatted);
 
-    pretty_assertions::assert_eq!(
+    similar_asserts::assert_eq!(
         source_formatted,
         expected,
         "(formatted == expected) in {}",
@@ -134,7 +146,7 @@ fn test_formatter(filename: &str, config: FormatterConfig, source: &str, expecte
 
     let expected_formatted = PrettyString(expected_formatted);
 
-    pretty_assertions::assert_eq!(
+    similar_asserts::assert_eq!(
         expected_formatted,
         expected,
         "(formatted == expected) in {}",
@@ -142,18 +154,40 @@ fn test_formatter(filename: &str, config: FormatterConfig, source: &str, expecte
     );
 }
 
-macro_rules! test_directories {
-    ($($dir:ident),+ $(,)?) => {$(
-        #[allow(non_snake_case)]
+#[derive(Clone, Copy, Default)]
+struct TestConfig {
+    /// Whether to compare the formatted source code AST with the original AST
+    skip_compare_ast_eq: bool,
+}
+
+impl TestConfig {
+    fn skip_compare_ast_eq() -> Self {
+        Self { skip_compare_ast_eq: true }
+    }
+}
+
+macro_rules! test_dir {
+    ($dir:ident $(,)?) => {
+        test_dir!($dir, Default::default());
+    };
+    ($dir:ident, $config:expr $(,)?) => {
+        #[expect(non_snake_case)]
         #[test]
         fn $dir() {
-            test_directory(stringify!($dir));
+            test_directory(stringify!($dir), $config);
         }
+    };
+}
+
+macro_rules! test_directories {
+    ($($dir:ident),+ $(,)?) => {$(
+        test_dir!($dir);
     )+};
 }
 
 test_directories! {
     ConstructorDefinition,
+    ConstructorModifierStyle,
     ContractDefinition,
     DocComments,
     EnumDefinition,
@@ -201,4 +235,10 @@ test_directories! {
     MappingType,
     EmitStatement,
     Repros,
+    BlockComments,
+    BlockCommentsFunction,
+    EnumVariants,
 }
+
+test_dir!(SortedImports, TestConfig::skip_compare_ast_eq());
+test_dir!(NonKeywords, TestConfig::skip_compare_ast_eq());

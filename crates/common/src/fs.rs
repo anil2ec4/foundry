@@ -1,13 +1,16 @@
-//! Contains various `std::fs` wrapper functions that also contain the target path in their errors
+//! Contains various `std::fs` wrapper functions that also contain the target path in their errors.
+
 use crate::errors::FsPathError;
-use serde::{de::DeserializeOwned, Serialize};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use serde::{Serialize, de::DeserializeOwned};
 use std::{
     fs::{self, File},
-    io::{BufWriter, Write},
+    io::{BufReader, BufWriter, Write},
     path::{Component, Path, PathBuf},
 };
 
-type Result<T> = std::result::Result<T, FsPathError>;
+/// The [`fs`](self) result type.
+pub type Result<T> = std::result::Result<T, FsPathError>;
 
 /// Wrapper for [`File::create`].
 pub fn create_file(path: impl AsRef<Path>) -> Result<fs::File> {
@@ -43,8 +46,16 @@ pub fn read_to_string(path: impl AsRef<Path>) -> Result<String> {
 pub fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     // read the file into a byte array first
     // https://github.com/serde-rs/json/issues/160
-    let bytes = read(path)?;
-    serde_json::from_slice(&bytes)
+    let s = read_to_string(path)?;
+    serde_json::from_str(&s).map_err(|source| FsPathError::ReadJson { source, path: path.into() })
+}
+
+/// Reads and decodes the json gzip file, then deserialize it into the provided type.
+pub fn read_json_gzip_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let file = open(path)?;
+    let reader = BufReader::new(file);
+    let decoder = GzDecoder::new(reader);
+    serde_json::from_reader(decoder)
         .map_err(|source| FsPathError::ReadJson { source, path: path.into() })
 }
 
@@ -55,6 +66,29 @@ pub fn write_json_file<T: Serialize>(path: &Path, obj: &T) -> Result<()> {
     serde_json::to_writer(&mut writer, obj)
         .map_err(|source| FsPathError::WriteJson { source, path: path.into() })?;
     writer.flush().map_err(|e| FsPathError::write(e, path))
+}
+
+/// Writes the object as a pretty JSON object.
+pub fn write_pretty_json_file<T: Serialize>(path: &Path, obj: &T) -> Result<()> {
+    let file = create_file(path)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, obj)
+        .map_err(|source| FsPathError::WriteJson { source, path: path.into() })?;
+    writer.flush().map_err(|e| FsPathError::write(e, path))
+}
+
+/// Writes the object as a gzip compressed file.
+pub fn write_json_gzip_file<T: Serialize>(path: &Path, obj: &T) -> Result<()> {
+    let file = create_file(path)?;
+    let writer = BufWriter::new(file);
+    let mut encoder = GzEncoder::new(writer, Compression::default());
+    serde_json::to_writer(&mut encoder, obj)
+        .map_err(|source| FsPathError::WriteJson { source, path: path.into() })?;
+    encoder
+        .finish()
+        .map_err(serde_json::Error::io)
+        .map_err(|source| FsPathError::WriteJson { source, path: path.into() })?;
+    Ok(())
 }
 
 /// Wrapper for `std::fs::write`
@@ -108,7 +142,7 @@ pub fn open(path: impl AsRef<Path>) -> Result<fs::File> {
 /// ref: <https://github.com/rust-lang/cargo/blob/9ded34a558a900563b0acf3730e223c649cf859d/crates/cargo-util/src/paths.rs#L81>
 pub fn normalize_path(path: &Path) -> PathBuf {
     let mut components = path.components().peekable();
-    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
+    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().copied() {
         components.next();
         PathBuf::from(c.as_os_str())
     } else {
@@ -133,19 +167,18 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     ret
 }
 
-/// Returns all files with the given extension under the `root` dir
-pub fn files_with_ext(root: impl AsRef<Path>, ext: &str) -> Vec<PathBuf> {
+/// Returns an iterator over all files with the given extension under the `root` dir.
+pub fn files_with_ext<'a>(root: &Path, ext: &'a str) -> impl Iterator<Item = PathBuf> + 'a {
     walkdir::WalkDir::new(root)
+        .sort_by_file_name()
         .into_iter()
         .filter_map(walkdir::Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| e.path().extension().map(|e| e == ext).unwrap_or_default())
-        .map(|e| e.path().into())
-        .collect()
+        .filter(|e| e.file_type().is_file() && e.path().extension() == Some(ext.as_ref()))
+        .map(walkdir::DirEntry::into_path)
 }
 
-/// Returns a list of absolute paths to all the json files under the root
-pub fn json_files(root: impl AsRef<Path>) -> Vec<PathBuf> {
+/// Returns an iterator over all JSON files under the `root` dir.
+pub fn json_files(root: &Path) -> impl Iterator<Item = PathBuf> {
     files_with_ext(root, "json")
 }
 

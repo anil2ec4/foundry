@@ -1,20 +1,17 @@
 //! Manages the block time
 
 use crate::eth::error::BlockchainError;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use std::{sync::Arc, time::Duration};
 
 /// Returns the `Utc` datetime for the given seconds since unix epoch
 pub fn utc_from_secs(secs: u64) -> DateTime<Utc> {
-    DateTime::<Utc>::from_naive_utc_and_offset(
-        NaiveDateTime::from_timestamp_opt(secs as i64, 0).unwrap(),
-        Utc,
-    )
+    DateTime::from_timestamp(secs as i64, 0).unwrap()
 }
 
 /// Manages block time
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct TimeManager {
     /// tracks the overall applied timestamp offset
     offset: Arc<RwLock<i128>>,
@@ -28,11 +25,9 @@ pub struct TimeManager {
     interval: Arc<RwLock<Option<u64>>>,
 }
 
-// === impl TimeManager ===
-
 impl TimeManager {
-    pub fn new(start_timestamp: u64) -> TimeManager {
-        let time_manager = TimeManager {
+    pub fn new(start_timestamp: u64) -> Self {
+        let time_manager = Self {
             last_timestamp: Default::default(),
             offset: Default::default(),
             next_exact_timestamp: Default::default(),
@@ -75,10 +70,10 @@ impl TimeManager {
     /// Fails if it's before (or at the same time) the last timestamp
     pub fn set_next_block_timestamp(&self, timestamp: u64) -> Result<(), BlockchainError> {
         trace!(target: "time", "override next timestamp {}", timestamp);
-        if timestamp <= *self.last_timestamp.read() {
+        if timestamp < *self.last_timestamp.read() {
             return Err(BlockchainError::TimestampError(format!(
-                "{timestamp} is lower than or equal to previous block's timestamp"
-            )))
+                "{timestamp} is lower than previous block's timestamp"
+            )));
         }
         self.next_exact_timestamp.write().replace(timestamp);
         Ok(())
@@ -117,7 +112,7 @@ impl TimeManager {
                 (current.saturating_add(self.offset()) as u64, false)
             };
         // Ensures that the timestamp is always increasing
-        if next_timestamp <= last_timestamp {
+        if next_timestamp < last_timestamp {
             next_timestamp = last_timestamp + 1;
         }
         let next_offset = update_offset.then_some((next_timestamp as i128) - current);

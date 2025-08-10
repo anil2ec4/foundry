@@ -3,12 +3,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Contains the config and rule set
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormatterConfig {
     /// Maximum line length where formatter will try to wrap the line
     pub line_length: usize,
-    /// Number of spaces per indentation level
+    /// Number of spaces per indentation level. Ignored if style is Tab
     pub tab_width: usize,
+    /// Style of indent
+    pub style: IndentStyle,
     /// Print spaces between brackets
     pub bracket_spacing: bool,
     /// Style of uint/int256 types
@@ -31,10 +33,12 @@ pub struct FormatterConfig {
     pub ignore: Vec<String>,
     /// Add new line at start and end of contract declarations
     pub contract_new_lines: bool,
+    /// Sort import statements alphabetically in groups (a group is separated by a newline).
+    pub sort_imports: bool,
 }
 
 /// Style of uint/int256 types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntTypes {
     /// Print the explicit uint256 or int256
@@ -46,7 +50,7 @@ pub enum IntTypes {
 }
 
 /// Style of underscores in number literals
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NumberUnderscore {
     /// Use the underscores defined in the source code
@@ -63,24 +67,24 @@ impl NumberUnderscore {
     /// Returns true if the option is `Preserve`
     #[inline]
     pub fn is_preserve(self) -> bool {
-        matches!(self, NumberUnderscore::Preserve)
+        matches!(self, Self::Preserve)
     }
 
     /// Returns true if the option is `Remove`
     #[inline]
     pub fn is_remove(self) -> bool {
-        matches!(self, NumberUnderscore::Remove)
+        matches!(self, Self::Remove)
     }
 
     /// Returns true if the option is `Remove`
     #[inline]
     pub fn is_thousands(self) -> bool {
-        matches!(self, NumberUnderscore::Thousands)
+        matches!(self, Self::Thousands)
     }
 }
 
 /// Style of underscores in hex literals
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HexUnderscore {
     /// Use the underscores defined in the source code
@@ -96,24 +100,24 @@ impl HexUnderscore {
     /// Returns true if the option is `Preserve`
     #[inline]
     pub fn is_preserve(self) -> bool {
-        matches!(self, HexUnderscore::Preserve)
+        matches!(self, Self::Preserve)
     }
 
     /// Returns true if the option is `Remove`
     #[inline]
     pub fn is_remove(self) -> bool {
-        matches!(self, HexUnderscore::Remove)
+        matches!(self, Self::Remove)
     }
 
     /// Returns true if the option is `Remove`
     #[inline]
     pub fn is_bytes(self) -> bool {
-        matches!(self, HexUnderscore::Bytes)
+        matches!(self, Self::Bytes)
     }
 }
 
 /// Style of string quotes
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuoteStyle {
     /// Use double quotes where possible
@@ -128,15 +132,15 @@ impl QuoteStyle {
     /// Get associated quotation mark with option
     pub fn quote(self) -> Option<char> {
         match self {
-            QuoteStyle::Double => Some('"'),
-            QuoteStyle::Single => Some('\''),
-            QuoteStyle::Preserve => None,
+            Self::Double => Some('"'),
+            Self::Single => Some('\''),
+            Self::Preserve => None,
         }
     }
 }
 
 /// Style of single line blocks in statements
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SingleLineBlockStyle {
     /// Prefer single line block when possible
@@ -148,23 +152,37 @@ pub enum SingleLineBlockStyle {
 }
 
 /// Style of function header in case it doesn't fit
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MultilineFuncHeaderStyle {
-    /// Write function parameters multiline first
+    /// Write function parameters multiline first.
     ParamsFirst,
-    /// Write function attributes multiline first
+    /// Write function parameters multiline first when there is more than one param.
+    ParamsFirstMulti,
+    /// Write function attributes multiline first.
     AttributesFirst,
-    /// If function params or attrs are multiline
+    /// If function params or attrs are multiline.
     /// split the rest
     All,
+    /// Same as `All` but writes function params multiline even when there is a single param.
+    AllParams,
+}
+
+/// Style of indent
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndentStyle {
+    #[default]
+    Space,
+    Tab,
 }
 
 impl Default for FormatterConfig {
     fn default() -> Self {
-        FormatterConfig {
+        Self {
             line_length: 120,
             tab_width: 4,
+            style: IndentStyle::Space,
             bracket_spacing: false,
             int_types: IntTypes::Long,
             multiline_func_header: MultilineFuncHeaderStyle::AttributesFirst,
@@ -176,6 +194,7 @@ impl Default for FormatterConfig {
             wrap_comments: false,
             ignore: vec![],
             contract_new_lines: false,
+            sort_imports: false,
         }
     }
 }

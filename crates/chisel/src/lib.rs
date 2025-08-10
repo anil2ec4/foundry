@@ -1,33 +1,22 @@
-#![doc = include_str!("../README.md")]
-#![warn(missing_docs)]
-#![warn(unused_extern_crates)]
-#![forbid(unsafe_code)]
-#![forbid(where_clauses_object_safety)]
+//! Chisel is a fast, utilitarian, and verbose Solidity REPL.
 
-/// REPL input dispatcher module
-pub mod dispatcher;
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-/// Builtin Chisel commands
+#[macro_use]
+extern crate foundry_common;
+
+pub mod args;
 pub mod cmd;
-
-pub mod history;
-
-/// Chisel Environment Module
-pub mod session;
-
-/// Chisel Session Source wrapper
-pub mod session_source;
-
-/// REPL contract runner
-pub mod runner;
-
-/// REPL contract executor
+pub mod dispatcher;
 pub mod executor;
-
-/// A Solidity Helper module for rustyline
+pub mod history;
+pub mod opts;
+pub mod runner;
+pub mod session;
+pub mod session_source;
 pub mod solidity_helper;
 
-/// Prelude of all chisel modules
 pub mod prelude {
     pub use crate::{
         cmd::*, dispatcher::*, runner::*, session::*, session_source::*, solidity_helper::*,

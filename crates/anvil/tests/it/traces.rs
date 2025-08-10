@@ -1,36 +1,55 @@
-use crate::fork::fork_config;
-use anvil::{spawn, NodeConfig};
-use ethers::{
-    contract::ContractInstance,
-    prelude::{
-        Action, ContractFactory, GethTrace, GethTraceFrame, Middleware, Signer, SignerMiddleware,
-        TransactionRequest,
-    },
-    types::{ActionType, Address, GethDebugTracingCallOptions, Trace},
-    utils::hex,
+use crate::{
+    abi::{Multicall, SimpleStorage},
+    fork::fork_config,
+    utils::http_provider_with_signer,
 };
-use ethers_solc::{project_util::TempProject, Artifact};
-use std::sync::Arc;
+use alloy_eips::BlockId;
+use alloy_hardforks::EthereumHardfork;
+use alloy_network::{EthereumWallet, TransactionBuilder};
+use alloy_primitives::{
+    Address, Bytes, U256,
+    hex::{self, FromHex},
+};
+use alloy_provider::{
+    Provider,
+    ext::{DebugApi, TraceApi},
+};
+use alloy_rpc_types::{
+    TransactionRequest,
+    state::StateOverride,
+    trace::{
+        filter::{TraceFilter, TraceFilterMode},
+        geth::{
+            CallConfig, GethDebugBuiltInTracerType, GethDebugTracerType,
+            GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace,
+        },
+        parity::{Action, LocalizedTransactionTrace},
+    },
+};
+use alloy_serde::WithOtherFields;
+use alloy_sol_types::sol;
+use anvil::{NodeConfig, spawn};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_transfer_parity_traces() {
     let (_api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = handle.ws_provider();
 
-    let accounts: Vec<_> = handle.dev_wallets().collect();
+    let accounts = handle.dev_wallets().collect::<Vec<_>>();
     let from = accounts[0].address();
     let to = accounts[1].address();
-    let amount = handle.genesis_balance().checked_div(2u64.into()).unwrap();
+    let amount = handle.genesis_balance().checked_div(U256::from(2u64)).unwrap();
     // specify the `from` field so that the client knows which account to use
-    let tx = TransactionRequest::new().to(to).value(amount).from(from);
+    let tx = TransactionRequest::default().to(to).value(amount).from(from);
+    let tx = WithOtherFields::new(tx);
 
     // broadcast it via the eth_sendTransaction API
-    let tx = provider.send_transaction(tx, None).await.unwrap().await.unwrap().unwrap();
+    let tx = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
 
     let traces = provider.trace_transaction(tx.transaction_hash).await.unwrap();
     assert!(!traces.is_empty());
 
-    match traces[0].action {
+    match traces[0].trace.action {
         Action::Call(ref call) => {
             assert_eq!(call.from, from);
             assert_eq!(call.to, to);
@@ -46,109 +65,248 @@ async fn test_get_transfer_parity_traces() {
     assert_eq!(traces, block_traces);
 }
 
+sol!(
+    #[sol(rpc, bytecode = "0x6080604052348015600f57600080fd5b50336000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff16021790555060a48061005e6000396000f3fe6080604052348015600f57600080fd5b506004361060285760003560e01c806375fc8e3c14602d575b600080fd5b60336035565b005b60008054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16fffea26469706673582212205006867290df97c54f2df1cb94fc081197ab670e2adf5353071d2ecce1d694b864736f6c634300080d0033")]
+    contract SuicideContract {
+        address payable private owner;
+        constructor() public {
+            owner = payable(msg.sender);
+        }
+        function goodbye() public {
+            selfdestruct(owner);
+        }
+    }
+);
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_parity_suicide_trace() {
-    let prj = TempProject::dapptools().unwrap();
-    prj.add_source(
-        "Contract",
-        r"
-pragma solidity 0.8.13;
-contract Contract {
-    address payable private owner;
-    constructor() public {
-        owner = payable(msg.sender);
-    }
-    function goodbye() public {
-        selfdestruct(owner);
-    }
-}
-",
-    )
-    .unwrap();
-
-    let mut compiled = prj.compile().unwrap();
-    assert!(!compiled.has_compiler_errors());
-    let contract = compiled.remove_first("Contract").unwrap();
-    let (abi, bytecode, _) = contract.into_contract_bytecode().into_parts();
-
-    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let (_api, handle) =
+        spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::Shanghai.into()))).await;
     let provider = handle.ws_provider();
     let wallets = handle.dev_wallets().collect::<Vec<_>>();
-    let client = Arc::new(SignerMiddleware::new(provider, wallets[0].clone()));
+    let owner = wallets[0].address();
+    let destructor = wallets[1].address();
 
-    // deploy successfully
-    let factory = ContractFactory::new(abi.clone().unwrap(), bytecode.unwrap(), client);
-    let contract = factory.deploy(()).unwrap().send().await.unwrap();
-
-    let contract = ContractInstance::new(
-        contract.address(),
-        abi.unwrap(),
-        SignerMiddleware::new(handle.http_provider(), wallets[1].clone()),
-    );
-    let call = contract.method::<_, ()>("goodbye", ()).unwrap();
-    let tx = call.send().await.unwrap().await.unwrap().unwrap();
+    let contract_addr =
+        SuicideContract::deploy_builder(provider.clone()).from(owner).deploy().await.unwrap();
+    let contract = SuicideContract::new(contract_addr, provider.clone());
+    let call = contract.goodbye().from(destructor);
+    let call = call.send().await.unwrap();
+    let tx = call.get_receipt().await.unwrap();
 
     let traces = handle.http_provider().trace_transaction(tx.transaction_hash).await.unwrap();
     assert!(!traces.is_empty());
-    assert_eq!(traces[0].action_type, ActionType::Suicide);
+    assert!(traces[1].trace.action.is_selfdestruct());
 }
+
+sol!(
+    #[sol(rpc, bytecode = "0x6080604052348015600f57600080fd5b50336000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff16021790555060a48061005e6000396000f3fe6080604052348015600f57600080fd5b506004361060285760003560e01c806375fc8e3c14602d575b600080fd5b60336035565b005b60008054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16fffea26469706673582212205006867290df97c54f2df1cb94fc081197ab670e2adf5353071d2ecce1d694b864736f6c634300080d0033")]
+    contract DebugTraceContract {
+        address payable private owner;
+        constructor() public {
+            owner = payable(msg.sender);
+        }
+        function goodbye() public {
+            selfdestruct(owner);
+        }
+    }
+);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_transfer_debug_trace_call() {
-    let prj = TempProject::dapptools().unwrap();
-    prj.add_source(
-        "Contract",
-        r"
-pragma solidity 0.8.13;
-contract Contract {
-    address payable private owner;
-    constructor() public {
-        owner = payable(msg.sender);
-    }
-    function goodbye() public {
-        selfdestruct(owner);
-    }
-}
-",
-    )
-    .unwrap();
-
-    let mut compiled = prj.compile().unwrap();
-    assert!(!compiled.has_compiler_errors());
-    let contract = compiled.remove_first("Contract").unwrap();
-    let (abi, bytecode, _) = contract.into_contract_bytecode().into_parts();
-
     let (_api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.ws_provider();
     let wallets = handle.dev_wallets().collect::<Vec<_>>();
-    let client = Arc::new(SignerMiddleware::new(provider, wallets[0].clone()));
+    let deployer: EthereumWallet = wallets[0].clone().into();
+    let provider = http_provider_with_signer(&handle.http_endpoint(), deployer);
 
-    // deploy successfully
-    let factory = ContractFactory::new(abi.clone().unwrap(), bytecode.unwrap(), client);
-    let contract = factory.deploy(()).unwrap().send().await.unwrap();
+    let contract_addr = DebugTraceContract::deploy_builder(provider.clone())
+        .from(wallets[0].clone().address())
+        .deploy()
+        .await
+        .unwrap();
 
-    let contract = ContractInstance::new(
-        contract.address(),
-        abi.unwrap(),
-        SignerMiddleware::new(handle.http_provider(), wallets[1].clone()),
-    );
-    let call = contract.method::<_, ()>("goodbye", ()).unwrap();
+    let caller: EthereumWallet = wallets[1].clone().into();
+    let caller_provider = http_provider_with_signer(&handle.http_endpoint(), caller);
+    let contract = DebugTraceContract::new(contract_addr, caller_provider);
+
+    let call = contract.goodbye().from(wallets[1].address());
+    let calldata = call.calldata().to_owned();
+
+    let tx = TransactionRequest::default()
+        .from(wallets[1].address())
+        .to(*contract.address())
+        .with_input(calldata);
 
     let traces = handle
         .http_provider()
-        .debug_trace_call(call.tx, None, GethDebugTracingCallOptions::default())
+        .debug_trace_call(
+            WithOtherFields::new(tx),
+            BlockId::latest(),
+            GethDebugTracingCallOptions::default(),
+        )
         .await
         .unwrap();
+
     match traces {
-        GethTrace::Known(traces) => match traces {
-            GethTraceFrame::Default(traces) => {
-                assert!(!traces.failed);
+        GethTrace::Default(default_frame) => {
+            assert!(!default_frame.failed);
+        }
+        _ => {
+            unreachable!()
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_call_tracer_debug_trace_call() {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let wallets = handle.dev_wallets().collect::<Vec<_>>();
+    let deployer: EthereumWallet = wallets[0].clone().into();
+    let provider = http_provider_with_signer(&handle.http_endpoint(), deployer);
+
+    let multicall_contract = Multicall::deploy(&provider).await.unwrap();
+
+    let simple_storage_contract =
+        SimpleStorage::deploy(&provider, "init value".to_string()).await.unwrap();
+
+    let set_value = simple_storage_contract.setValue("bar".to_string());
+    let set_value_calldata = set_value.calldata();
+
+    let internal_call_tx_builder = multicall_contract.aggregate(vec![Multicall::Call {
+        target: *simple_storage_contract.address(),
+        callData: set_value_calldata.to_owned(),
+    }]);
+
+    let internal_call_tx_calldata = internal_call_tx_builder.calldata().to_owned();
+
+    // calling SimpleStorage contract through Multicall should result in an internal call
+    let internal_call_tx = TransactionRequest::default()
+        .from(wallets[1].address())
+        .to(*multicall_contract.address())
+        .with_input(internal_call_tx_calldata);
+
+    let internal_call_tx_traces = handle
+        .http_provider()
+        .debug_trace_call(
+            WithOtherFields::new(internal_call_tx.clone()),
+            BlockId::latest(),
+            GethDebugTracingCallOptions::default().with_tracing_options(
+                GethDebugTracingOptions::default()
+                    .with_tracer(GethDebugTracerType::from(GethDebugBuiltInTracerType::CallTracer))
+                    .with_call_config(CallConfig::default().with_log()),
+            ),
+        )
+        .await
+        .unwrap();
+
+    match internal_call_tx_traces {
+        GethTrace::CallTracer(call_frame) => {
+            assert!(call_frame.calls.len() == 1);
+            assert!(
+                call_frame.calls.first().unwrap().to.unwrap() == *simple_storage_contract.address()
+            );
+            assert!(call_frame.calls.first().unwrap().logs.len() == 1);
+        }
+        _ => {
+            unreachable!()
+        }
+    }
+
+    // only_top_call option - should not return any internal calls
+    let internal_call_only_top_call_tx_traces = handle
+        .http_provider()
+        .debug_trace_call(
+            WithOtherFields::new(internal_call_tx.clone()),
+            BlockId::latest(),
+            GethDebugTracingCallOptions::default().with_tracing_options(
+                GethDebugTracingOptions::default()
+                    .with_tracer(GethDebugTracerType::from(GethDebugBuiltInTracerType::CallTracer))
+                    .with_call_config(CallConfig::default().with_log().only_top_call()),
+            ),
+        )
+        .await
+        .unwrap();
+
+    match internal_call_only_top_call_tx_traces {
+        GethTrace::CallTracer(call_frame) => {
+            assert!(call_frame.calls.is_empty());
+        }
+        _ => {
+            unreachable!()
+        }
+    }
+
+    // directly calling the SimpleStorage contract should not result in any internal calls
+    let direct_call_tx = TransactionRequest::default()
+        .from(wallets[1].address())
+        .to(*simple_storage_contract.address())
+        .with_input(set_value_calldata.to_owned());
+
+    let direct_call_tx_traces = handle
+        .http_provider()
+        .debug_trace_call(
+            WithOtherFields::new(direct_call_tx),
+            BlockId::latest(),
+            GethDebugTracingCallOptions::default().with_tracing_options(
+                GethDebugTracingOptions::default()
+                    .with_tracer(GethDebugTracerType::from(GethDebugBuiltInTracerType::CallTracer))
+                    .with_call_config(CallConfig::default().with_log()),
+            ),
+        )
+        .await
+        .unwrap();
+
+    match direct_call_tx_traces {
+        GethTrace::CallTracer(call_frame) => {
+            assert!(call_frame.calls.is_empty());
+            assert!(call_frame.to.unwrap() == *simple_storage_contract.address());
+            assert!(call_frame.logs.len() == 1);
+        }
+        _ => {
+            unreachable!()
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_debug_trace_call_state_override() {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let wallets = handle.dev_wallets().collect::<Vec<_>>();
+
+    let tx = TransactionRequest::default()
+        .from(wallets[1].address())
+        .to("0x1234567890123456789012345678901234567890".parse().unwrap());
+
+    let override_json = r#"{
+            "0x1234567890123456789012345678901234567890": {
+                "balance": "0x01",
+                "code": "0x30315f5260205ff3"
             }
-            _ => {
-                unreachable!()
-            }
-        },
-        GethTrace::Unknown(_) => {
+        }"#;
+
+    let state_override: StateOverride = serde_json::from_str(override_json).unwrap();
+
+    let tx_traces = handle
+        .http_provider()
+        .debug_trace_call(
+            WithOtherFields::new(tx.clone()),
+            BlockId::latest(),
+            GethDebugTracingCallOptions::default()
+                .with_tracing_options(GethDebugTracingOptions::default())
+                .with_state_overrides(state_override),
+        )
+        .await
+        .unwrap();
+
+    match tx_traces {
+        GethTrace::Default(trace_res) => {
+            assert_eq!(
+                trace_res.return_value,
+                Bytes::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                    .unwrap()
+            );
+        }
+        _ => {
             unreachable!()
         }
     }
@@ -164,15 +322,20 @@ async fn test_trace_address_fork() {
 
     let from: Address = "0x2e4777139254ff76db957e284b186a4507ff8c67".parse().unwrap();
     let to: Address = "0xe2f2a5c287993345a840db3b0845fbc70f5935a5".parse().unwrap();
-    let tx = TransactionRequest::new().to(to).from(from).data(input).gas(300_000);
+    let tx = TransactionRequest::default()
+        .to(to)
+        .from(from)
+        .with_input::<Bytes>(input.into())
+        .with_gas_limit(300_000);
 
+    let tx = WithOtherFields::new(tx);
     api.anvil_impersonate_account(from).await.unwrap();
 
-    let tx = provider.send_transaction(tx, None).await.unwrap().await.unwrap().unwrap();
+    let tx = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
 
     let traces = provider.trace_transaction(tx.transaction_hash).await.unwrap();
     assert!(!traces.is_empty());
-    match traces[0].action {
+    match traces[0].trace.action {
         Action::Call(ref call) => {
             assert_eq!(call.from, from);
             assert_eq!(call.to, to);
@@ -330,13 +493,13 @@ async fn test_trace_address_fork() {
         }
     ]);
 
-    let expected_traces: Vec<Trace> = serde_json::from_value(json).unwrap();
+    let expected_traces: Vec<LocalizedTransactionTrace> = serde_json::from_value(json).unwrap();
 
     // test matching traceAddress
     traces.into_iter().zip(expected_traces).for_each(|(a, b)| {
-        assert_eq!(a.trace_address, b.trace_address);
-        assert_eq!(a.subtraces, b.subtraces);
-        match (a.action, b.action) {
+        assert_eq!(a.trace.trace_address, b.trace.trace_address);
+        assert_eq!(a.trace.subtraces, b.trace.subtraces);
+        match (a.trace.action, b.trace.action) {
             (Action::Call(a), Action::Call(b)) => {
                 assert_eq!(a.from, b.from);
                 assert_eq!(a.to, b.to);
@@ -357,17 +520,23 @@ async fn test_trace_address_fork2() {
 
     let from: Address = "0xa009fa1ac416ec02f6f902a3a4a584b092ae6123".parse().unwrap();
     let to: Address = "0x99999999d116ffa7d76590de2f427d8e15aeb0b8".parse().unwrap();
-    let tx = TransactionRequest::new().to(to).from(from).data(input).gas(350_000);
+    let tx = TransactionRequest::default()
+        .to(to)
+        .from(from)
+        .with_input::<Bytes>(input.into())
+        .with_gas_limit(350_000);
 
+    let tx = WithOtherFields::new(tx);
     api.anvil_impersonate_account(from).await.unwrap();
 
-    let tx = provider.send_transaction(tx, None).await.unwrap().await.unwrap().unwrap();
-    assert_eq!(tx.status, Some(1u64.into()));
+    let tx = provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
+    let status = tx.inner.inner.inner.receipt.status.coerce_status();
+    assert!(status);
 
     let traces = provider.trace_transaction(tx.transaction_hash).await.unwrap();
 
     assert!(!traces.is_empty());
-    match traces[0].action {
+    match traces[0].trace.action {
         Action::Call(ref call) => {
             assert_eq!(call.from, from);
             assert_eq!(call.to, to);
@@ -588,13 +757,13 @@ async fn test_trace_address_fork2() {
         }
     ]);
 
-    let expected_traces: Vec<Trace> = serde_json::from_value(json).unwrap();
+    let expected_traces: Vec<LocalizedTransactionTrace> = serde_json::from_value(json).unwrap();
 
     // test matching traceAddress
     traces.into_iter().zip(expected_traces).for_each(|(a, b)| {
-        assert_eq!(a.trace_address, b.trace_address);
-        assert_eq!(a.subtraces, b.subtraces);
-        match (a.action, b.action) {
+        assert_eq!(a.trace.trace_address, b.trace.trace_address);
+        assert_eq!(a.trace.subtraces, b.trace.subtraces);
+        match (a.trace.action, b.trace.action) {
             (Action::Call(a), Action::Call(b)) => {
                 assert_eq!(a.from, b.from);
                 assert_eq!(a.to, b.to);
@@ -602,4 +771,334 @@ async fn test_trace_address_fork2() {
             _ => unreachable!("unexpected action"),
         }
     })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_trace_filter() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.ws_provider();
+
+    let accounts = handle.dev_wallets().collect::<Vec<_>>();
+    let from = accounts[0].address();
+    let to = accounts[1].address();
+    let from_two = accounts[2].address();
+    let to_two = accounts[3].address();
+
+    // Test default block ranges.
+    // From will be earliest, to will be best/latest
+    let tracer = TraceFilter {
+        from_block: None,
+        to_block: None,
+        from_address: vec![],
+        to_address: vec![],
+        mode: TraceFilterMode::Intersection,
+        after: None,
+        count: None,
+    };
+
+    for i in 0..=5 {
+        let tx = TransactionRequest::default().to(to).value(U256::from(i)).from(from);
+        let tx = WithOtherFields::new(tx);
+        api.send_transaction(tx).await.unwrap();
+    }
+
+    let traces = api.trace_filter(tracer).await.unwrap();
+    assert_eq!(traces.len(), 5);
+
+    // Test filtering by address
+    let tracer = TraceFilter {
+        from_block: Some(provider.get_block_number().await.unwrap()),
+        to_block: None,
+        from_address: vec![from_two],
+        to_address: vec![to_two],
+        mode: TraceFilterMode::Intersection,
+        after: None,
+        count: None,
+    };
+
+    for i in 0..=5 {
+        let tx = TransactionRequest::default().to(to).value(U256::from(i)).from(from);
+        let tx = WithOtherFields::new(tx);
+        provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
+
+        let tx = TransactionRequest::default().to(to_two).value(U256::from(i)).from(from_two);
+        let tx = WithOtherFields::new(tx);
+        provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
+    }
+
+    let traces = api.trace_filter(tracer).await.unwrap();
+    assert_eq!(traces.len(), 6);
+
+    // Test for the following actions:
+    // Create (deploy the contract)
+    // Call (goodbye function)
+    // SelfDestruct (side-effect of goodbye)
+    let contract_addr =
+        SuicideContract::deploy_builder(provider.clone()).from(from).deploy().await.unwrap();
+    let contract = SuicideContract::new(contract_addr, provider.clone());
+
+    // Test TraceActions
+    let tracer = TraceFilter {
+        from_block: Some(provider.get_block_number().await.unwrap()),
+        to_block: None,
+        from_address: vec![from, contract_addr],
+        to_address: vec![], // Leave as 0 address
+        mode: TraceFilterMode::Union,
+        after: None,
+        count: None,
+    };
+
+    // Execute call
+    let call = contract.goodbye().from(from);
+    let call = call.send().await.unwrap();
+    call.get_receipt().await.unwrap();
+
+    // Mine transactions to filter against
+    for i in 0..=5 {
+        let tx = TransactionRequest::default().to(to_two).value(U256::from(i)).from(from_two);
+        let tx = WithOtherFields::new(tx);
+        provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
+    }
+
+    let traces = api.trace_filter(tracer).await.unwrap();
+    assert_eq!(traces.len(), 3);
+
+    // Test Range Error
+    let latest = provider.get_block_number().await.unwrap();
+    let tracer = TraceFilter {
+        from_block: Some(latest),
+        to_block: Some(latest + 301),
+        from_address: vec![],
+        to_address: vec![],
+        mode: TraceFilterMode::Union,
+        after: None,
+        count: None,
+    };
+
+    let traces = api.trace_filter(tracer).await;
+    assert!(traces.is_err());
+
+    // Test same from and to block is valid
+    let latest = provider.get_block_number().await.unwrap();
+    let tracer = TraceFilter {
+        from_block: Some(latest),
+        to_block: Some(latest),
+        from_address: vec![],
+        to_address: vec![],
+        mode: TraceFilterMode::Union,
+        after: None,
+        count: None,
+    };
+
+    let traces = api.trace_filter(tracer).await;
+    assert!(traces.is_ok());
+
+    // Test invalid block range
+    let latest = provider.get_block_number().await.unwrap();
+    let tracer = TraceFilter {
+        from_block: Some(latest + 10),
+        to_block: Some(latest),
+        from_address: vec![],
+        to_address: vec![],
+        mode: TraceFilterMode::Union,
+        after: None,
+        count: None,
+    };
+
+    let traces = api.trace_filter(tracer).await;
+    assert!(traces.is_err());
+
+    // Test after and count
+    let tracer = TraceFilter {
+        from_block: Some(provider.get_block_number().await.unwrap()),
+        to_block: None,
+        from_address: vec![],
+        to_address: vec![],
+        mode: TraceFilterMode::Union,
+        after: Some(3),
+        count: Some(5),
+    };
+
+    for i in 0..=10 {
+        let tx = TransactionRequest::default().to(to).value(U256::from(i)).from(from);
+        let tx = WithOtherFields::new(tx);
+        provider.send_transaction(tx).await.unwrap().get_receipt().await.unwrap();
+    }
+
+    let traces = api.trace_filter(tracer).await.unwrap();
+    assert_eq!(traces.len(), 5);
+}
+
+#[cfg(feature = "js-tracer")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_call_tracer_debug_trace_call_js_tracer() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let wallets = handle.dev_wallets().collect::<Vec<_>>();
+    let deployer: EthereumWallet = wallets[0].clone().into();
+    let provider = http_provider_with_signer(&handle.http_endpoint(), deployer);
+
+    let multicall_contract = Multicall::deploy(&provider).await.unwrap();
+    let simple_storage_contract =
+        SimpleStorage::deploy(&provider, "init value".to_string()).await.unwrap();
+
+    let set_value = simple_storage_contract.setValue("bar".to_string());
+    let set_value_calldata = set_value.calldata();
+
+    let internal_call_tx_builder = multicall_contract.aggregate(vec![Multicall::Call {
+        target: *simple_storage_contract.address(),
+        callData: set_value_calldata.to_owned(),
+    }]);
+
+    let internal_call_tx_calldata = internal_call_tx_builder.calldata().to_owned();
+
+    let internal_call_tx = TransactionRequest::default()
+        .from(wallets[1].address())
+        .to(*multicall_contract.address())
+        .with_input(internal_call_tx_calldata);
+
+    let js_tracer_code = r#"
+{
+data: [],
+step: function(log) {
+    var op = log.op.toString();
+    if (op === "SLOAD") {
+    this.data.push(log.getPC() + ": SLOAD " + log.contract.getAddress() + ":" + log.stack.peek(0));
+    this.data.push("    Result: " + log.stack.peek(0));
+    } else if (op === "SSTORE") {
+    this.data.push(log.getPC() + ": SSTORE " + log.contract.getAddress() + ":" + log.stack.peek(1) + " <- " + log.stack.peek(0));
+    }
+},
+result: function() {
+    return this.data;
+},
+fault: function(log) {}
+}
+"#;
+
+    let result = api
+        .debug_trace_call(
+            WithOtherFields::new(internal_call_tx),
+            Some(BlockId::latest()),
+            GethDebugTracingCallOptions::default()
+                .with_tracing_options(GethDebugTracingOptions::js_tracer(js_tracer_code)),
+        )
+        .await
+        .unwrap();
+
+    let expected = vec![
+        "547: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:0",
+        "    Result: 0",
+        "1907: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:1",
+        "    Result: 1",
+        "772: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:1",
+        "    Result: 1",
+        "835: SSTORE 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:44498830125527143464827115118378702402016761369235290884359940707316142178310 <- 1",
+        "919: SSTORE 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:0 <- 80084422859880547211683076133703299733277748156566366325829078699459944778998",
+        "712: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:0",
+        "    Result: 0",
+        "765: SSTORE 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:546584486846459126461364135121053344201067465379 <- 0",
+    ];
+
+    let actual: Vec<String> = result
+        .try_into_json_value()
+        .ok()
+        .and_then(|val| val.as_array().cloned())
+        .map(|arr| arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    assert_eq!(actual, expected);
+}
+
+#[cfg(feature = "js-tracer")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_debug_trace_transaction_js_tracer() {
+    let node_config = NodeConfig::test().with_hardfork(Some(EthereumHardfork::Prague.into()));
+    let (api, handle) = spawn(node_config).await;
+    let provider = crate::utils::http_provider(&handle.http_endpoint());
+
+    let wallets = handle.dev_wallets().collect::<Vec<_>>();
+    let from = wallets[0].address();
+    api.anvil_add_balance(from, U256::MAX).await.unwrap();
+    api.anvil_add_balance(wallets[1].address(), U256::MAX).await.unwrap();
+
+    let multicall_contract = Multicall::deploy(&provider).await.unwrap();
+    let simple_storage_contract =
+        SimpleStorage::deploy(&provider, "init value".to_string()).await.unwrap();
+
+    let set_value = simple_storage_contract.setValue("bar".to_string());
+    let set_value_calldata = set_value.calldata();
+
+    let internal_call_tx_builder = multicall_contract.aggregate(vec![Multicall::Call {
+        target: *simple_storage_contract.address(),
+        callData: set_value_calldata.to_owned(),
+    }]);
+
+    let internal_call_tx_calldata = internal_call_tx_builder.calldata().to_owned();
+
+    let internal_call_tx = TransactionRequest::default()
+        .from(wallets[1].address())
+        .to(*multicall_contract.address())
+        .with_input(internal_call_tx_calldata)
+        .with_gas_limit(1_000_000)
+        .with_max_fee_per_gas(100_000_000_000)
+        .with_max_priority_fee_per_gas(100_000_000_000);
+
+    let receipt = provider
+        .send_transaction(internal_call_tx.into())
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    let js_tracer_code = r#"
+{
+data: [],
+step: function(log) {
+    var op = log.op.toString();
+    var pc = log.getPC();
+    var addr = log.contract.getAddress();
+
+    if (op === "SLOAD") {
+        this.data.push(pc + ": SLOAD " + addr + ":" + log.stack.peek(0));
+        this.data.push("    Result: " + log.stack.peek(0));
+    } else if (op === "SSTORE") {
+        this.data.push(pc + ": SSTORE " + addr + ":" + log.stack.peek(1) + " <- " + log.stack.peek(0));
+    } 
+},
+result: function() {
+    return this.data;
+},
+fault: function(log) {}
+}
+"#;
+
+    let expected = vec![
+        "547: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:0",
+        "    Result: 0",
+        "1907: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:1",
+        "    Result: 1",
+        "772: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:1",
+        "    Result: 1",
+        "835: SSTORE 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:44498830125527143464827115118378702402016761369235290884359940707316142178310 <- 1",
+        "919: SSTORE 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:0 <- 80084422859880547211683076133703299733277748156566366325829078699459944778998",
+        "712: SLOAD 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:0",
+        "    Result: 0",
+        "765: SSTORE 231,241,114,94,119,52,206,40,143,131,103,225,187,20,62,144,187,63,5,18:546584486846459126461364135121053344201067465379 <- 0",
+    ];
+    let result = api
+        .debug_trace_transaction(
+            receipt.transaction_hash,
+            GethDebugTracingOptions::js_tracer(js_tracer_code),
+        )
+        .await
+        .unwrap();
+
+    let actual: Vec<String> = result
+        .try_into_json_value()
+        .ok()
+        .and_then(|val| val.as_array().cloned())
+        .map(|arr| arr.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    assert_eq!(actual, expected);
 }

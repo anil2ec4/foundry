@@ -5,7 +5,7 @@ use std::str::FromStr;
 /// Helper to convert a string number into a comparable one
 fn to_num(string: &str) -> I256 {
     if string.is_empty() {
-        return I256::ZERO
+        return I256::ZERO;
     }
     string.replace('_', "").trim().parse().unwrap()
 }
@@ -14,7 +14,7 @@ fn to_num(string: &str) -> I256 {
 /// This will reverse the number so that 0's can be ignored
 fn to_num_reversed(string: &str) -> U256 {
     if string.is_empty() {
-        return U256::from(0)
+        return U256::from(0);
     }
     string.replace('_', "").trim().chars().rev().collect::<String>().parse().unwrap()
 }
@@ -56,10 +56,10 @@ impl AstEq for VariableDefinition {
             attrs.sort();
             attrs
         };
-        self.ty.ast_eq(&other.ty) &&
-            self.name.ast_eq(&other.name) &&
-            self.initializer.ast_eq(&other.initializer) &&
-            sorted_attrs(self).ast_eq(&sorted_attrs(other))
+        self.ty.ast_eq(&other.ty)
+            && self.name.ast_eq(&other.name)
+            && self.initializer.ast_eq(&other.initializer)
+            && sorted_attrs(self).ast_eq(&sorted_attrs(other))
     }
 }
 
@@ -78,20 +78,20 @@ impl AstEq for FunctionDefinition {
         let left_returns = filter_params(&self.returns);
         let right_returns = filter_params(&other.returns);
 
-        self.ty.ast_eq(&other.ty) &&
-            self.name.ast_eq(&other.name) &&
-            left_params.ast_eq(&right_params) &&
-            self.return_not_returns.ast_eq(&other.return_not_returns) &&
-            left_returns.ast_eq(&right_returns) &&
-            self.body.ast_eq(&other.body) &&
-            sorted_attrs(self).ast_eq(&sorted_attrs(other))
+        self.ty.ast_eq(&other.ty)
+            && self.name.ast_eq(&other.name)
+            && left_params.ast_eq(&right_params)
+            && self.return_not_returns.ast_eq(&other.return_not_returns)
+            && left_returns.ast_eq(&right_returns)
+            && self.body.ast_eq(&other.body)
+            && sorted_attrs(self).ast_eq(&sorted_attrs(other))
     }
 }
 
 impl AstEq for Base {
     fn ast_eq(&self, other: &Self) -> bool {
-        self.name.ast_eq(&other.name) &&
-            self.args.clone().unwrap_or_default().ast_eq(&other.args.clone().unwrap_or_default())
+        self.name.ast_eq(&other.name)
+            && self.args.clone().unwrap_or_default().ast_eq(&other.args.clone().unwrap_or_default())
     }
 }
 
@@ -225,13 +225,13 @@ macro_rules! wrap_in_box {
 impl AstEq for Statement {
     fn ast_eq(&self, other: &Self) -> bool {
         match self {
-            Statement::If(loc, expr, stmt1, stmt2) => {
-                #[allow(clippy::borrowed_box)]
-                let wrap_if = |stmt1: &Box<Statement>, stmt2: &Option<Box<Statement>>| {
+            Self::If(loc, expr, stmt1, stmt2) => {
+                #[expect(clippy::borrowed_box)]
+                let wrap_if = |stmt1: &Box<Self>, stmt2: &Option<Box<Self>>| {
                     (
                         wrap_in_box!(stmt1, *loc),
                         stmt2.as_ref().map(|stmt2| {
-                            if matches!(**stmt2, Statement::If(..)) {
+                            if matches!(**stmt2, Self::If(..)) {
                                 stmt2.clone()
                             } else {
                                 wrap_in_box!(stmt2, *loc)
@@ -241,7 +241,7 @@ impl AstEq for Statement {
                 };
                 let (stmt1, stmt2) = wrap_if(stmt1, stmt2);
                 let left = (loc, expr, &stmt1, &stmt2);
-                if let Statement::If(loc, expr, stmt1, stmt2) = other {
+                if let Self::If(loc, expr, stmt1, stmt2) = other {
                     let (stmt1, stmt2) = wrap_if(stmt1, stmt2);
                     let right = (loc, expr, &stmt1, &stmt2);
                     left.ast_eq(&right)
@@ -249,10 +249,10 @@ impl AstEq for Statement {
                     false
                 }
             }
-            Statement::While(loc, expr, stmt1) => {
+            Self::While(loc, expr, stmt1) => {
                 let stmt1 = wrap_in_box!(stmt1, *loc);
                 let left = (loc, expr, &stmt1);
-                if let Statement::While(loc, expr, stmt1) = other {
+                if let Self::While(loc, expr, stmt1) = other {
                     let stmt1 = wrap_in_box!(stmt1, *loc);
                     let right = (loc, expr, &stmt1);
                     left.ast_eq(&right)
@@ -260,10 +260,10 @@ impl AstEq for Statement {
                     false
                 }
             }
-            Statement::DoWhile(loc, stmt1, expr) => {
+            Self::DoWhile(loc, stmt1, expr) => {
                 let stmt1 = wrap_in_box!(stmt1, *loc);
                 let left = (loc, &stmt1, expr);
-                if let Statement::DoWhile(loc, stmt1, expr) = other {
+                if let Self::DoWhile(loc, stmt1, expr) = other {
                     let stmt1 = wrap_in_box!(stmt1, *loc);
                     let right = (loc, &stmt1, expr);
                     left.ast_eq(&right)
@@ -271,10 +271,10 @@ impl AstEq for Statement {
                     false
                 }
             }
-            Statement::For(loc, stmt1, expr, stmt2, stmt3) => {
+            Self::For(loc, stmt1, expr, stmt2, stmt3) => {
                 let stmt3 = stmt3.as_ref().map(|stmt3| wrap_in_box!(stmt3, *loc));
                 let left = (loc, stmt1, expr, stmt2, &stmt3);
-                if let Statement::For(loc, stmt1, expr, stmt2, stmt3) = other {
+                if let Self::For(loc, stmt1, expr, stmt2, stmt3) = other {
                     let stmt3 = stmt3.as_ref().map(|stmt3| wrap_in_box!(stmt3, *loc));
                     let right = (loc, stmt1, expr, stmt2, &stmt3);
                     left.ast_eq(&right)
@@ -282,11 +282,11 @@ impl AstEq for Statement {
                     false
                 }
             }
-            Statement::Try(loc, expr, returns, catch) => {
+            Self::Try(loc, expr, returns, catch) => {
                 let left_returns =
                     returns.as_ref().map(|(params, stmt)| (filter_params(params), stmt));
                 let left = (loc, expr, left_returns, catch);
-                if let Statement::Try(loc, expr, returns, catch) = other {
+                if let Self::Try(loc, expr, returns, catch) = other {
                     let right_returns =
                         returns.as_ref().map(|(params, stmt)| (filter_params(params), stmt));
                     let right = (loc, expr, right_returns, catch);
@@ -387,6 +387,8 @@ derive_ast_eq! { (0 A, 1 B) }
 derive_ast_eq! { (0 A, 1 B, 2 C) }
 derive_ast_eq! { (0 A, 1 B, 2 C, 3 D) }
 derive_ast_eq! { (0 A, 1 B, 2 C, 3 D, 4 E) }
+derive_ast_eq! { (0 A, 1 B, 2 C, 3 D, 4 E, 5 F) }
+derive_ast_eq! { (0 A, 1 B, 2 C, 3 D, 4 E, 5 F, 6 G) }
 derive_ast_eq! { bool }
 derive_ast_eq! { u8 }
 derive_ast_eq! { u16 }
@@ -413,7 +415,7 @@ derive_ast_eq! { struct VariableDeclaration { loc, ty, storage, name } }
 derive_ast_eq! { struct Using { loc, list, ty, global } }
 derive_ast_eq! { struct UsingFunction { loc, path, oper } }
 derive_ast_eq! { struct TypeDefinition { loc, name, ty } }
-derive_ast_eq! { struct ContractDefinition { loc, ty, name, base, parts } }
+derive_ast_eq! { struct ContractDefinition { loc, ty, name, base, layout, parts } }
 derive_ast_eq! { struct EventParameter { loc, ty, indexed, name } }
 derive_ast_eq! { struct ErrorParameter { loc, ty, name } }
 derive_ast_eq! { struct EventDefinition { loc, name, fields, anonymous } }
@@ -421,6 +423,13 @@ derive_ast_eq! { struct ErrorDefinition { loc, keyword, name, fields } }
 derive_ast_eq! { struct StructDefinition { loc, name, fields } }
 derive_ast_eq! { struct EnumDefinition { loc, name, values } }
 derive_ast_eq! { struct Annotation { loc, id, value } }
+derive_ast_eq! { enum PragmaDirective {
+    _
+    Identifier(loc, id1, id2),
+    StringLiteral(loc, id, lit),
+    Version(loc, id, version),
+    _
+}}
 derive_ast_eq! { enum UsingList {
     Error,
     _
@@ -480,6 +489,7 @@ derive_ast_eq! { enum StorageLocation {
     Memory(loc),
     Storage(loc),
     Calldata(loc),
+    Transient(loc),
     _
 }}
 derive_ast_eq! { enum Type {
@@ -615,7 +625,7 @@ derive_ast_eq! { enum YulSwitchOptions {
 derive_ast_eq! { enum SourceUnitPart {
     _
     ContractDefinition(def),
-    PragmaDirective(loc, ident, string),
+    PragmaDirective(pragma),
     ImportDirective(import),
     EnumDefinition(def),
     StructDefinition(def),
@@ -679,5 +689,20 @@ derive_ast_eq! { enum VariableAttribute {
     Constant(loc),
     Immutable(loc),
     Override(loc, idents),
+    StorageType(st),
+    StorageLocation(st),
     _
 }}
+
+// Who cares
+impl AstEq for StorageType {
+    fn ast_eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl AstEq for VersionComparator {
+    fn ast_eq(&self, _other: &Self) -> bool {
+        true
+    }
+}

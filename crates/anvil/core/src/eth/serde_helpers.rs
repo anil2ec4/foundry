@@ -1,12 +1,10 @@
 //! custom serde helper functions
 
-#[allow(unused)]
 pub mod sequence {
     use serde::{
-        de::DeserializeOwned, ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer,
+        Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned, ser::SerializeSeq,
     };
 
-    #[allow(unused)]
     pub fn serialize<S, T>(val: &T, s: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -27,7 +25,7 @@ pub mod sequence {
             return Err(serde::de::Error::custom(format!(
                 "expected params sequence with length 1 but got {}",
                 seq.len()
-            )))
+            )));
         }
         Ok(seq.remove(0))
     }
@@ -46,8 +44,27 @@ pub mod empty_params {
             return Err(serde::de::Error::custom(format!(
                 "expected params sequence with length 0 but got {}",
                 seq.len()
-            )))
+            )));
         }
         Ok(())
+    }
+}
+
+/// A module that deserializes either a BlockNumberOrTag, or a simple number.
+pub mod lenient_block_number {
+    pub use alloy_eips::eip1898::LenientBlockNumberOrTag;
+    use alloy_rpc_types::BlockNumberOrTag;
+    use serde::{Deserialize, Deserializer};
+
+    /// deserializes either a BlockNumberOrTag, or a simple number.
+    pub use alloy_eips::eip1898::lenient_block_number_or_tag::deserialize as lenient_block_number;
+
+    /// Same as `lenient_block_number` but requires to be `[num; 1]`
+    pub fn lenient_block_number_seq<'de, D>(deserializer: D) -> Result<BlockNumberOrTag, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let num = <[LenientBlockNumberOrTag; 1]>::deserialize(deserializer)?[0].into();
+        Ok(num)
     }
 }

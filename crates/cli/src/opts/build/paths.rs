@@ -1,74 +1,81 @@
 use clap::{Parser, ValueHint};
 use eyre::Result;
-use foundry_compilers::remappings::Remapping;
+use foundry_compilers::artifacts::remappings::Remapping;
 use foundry_config::{
-    figment,
+    Config, figment,
     figment::{
+        Metadata, Profile, Provider,
         error::Kind::InvalidType,
         value::{Dict, Map, Value},
-        Metadata, Profile, Provider,
     },
-    find_project_root_path, remappings_from_env_var, Config,
+    find_project_root, remappings_from_env_var,
 };
 use serde::Serialize;
 use std::path::PathBuf;
 
 /// Common arguments for a project's paths.
-#[derive(Debug, Clone, Parser, Serialize, Default)]
-#[clap(next_help_heading = "Project options")]
-pub struct ProjectPathsArgs {
+#[derive(Clone, Debug, Default, Serialize, Parser)]
+#[command(next_help_heading = "Project options")]
+pub struct ProjectPathOpts {
     /// The project's root path.
     ///
     /// By default root of the Git repository, if in one,
     /// or the current working directory.
-    #[clap(long, value_hint = ValueHint::DirPath, value_name = "PATH")]
+    #[arg(long, value_hint = ValueHint::DirPath, value_name = "PATH")]
     #[serde(skip)]
     pub root: Option<PathBuf>,
 
     /// The contracts source directory.
-    #[clap(long, short = 'C', value_hint = ValueHint::DirPath, value_name = "PATH")]
+    #[arg(long, short = 'C', value_hint = ValueHint::DirPath, value_name = "PATH")]
     #[serde(rename = "src", skip_serializing_if = "Option::is_none")]
     pub contracts: Option<PathBuf>,
 
     /// The project's remappings.
-    #[clap(long, short = 'R')]
+    #[arg(long, short = 'R')]
     #[serde(skip)]
     pub remappings: Vec<Remapping>,
 
     /// The project's remappings from the environment.
-    #[clap(long, value_name = "ENV")]
+    #[arg(long, value_name = "ENV")]
     #[serde(skip)]
     pub remappings_env: Option<String>,
 
     /// The path to the compiler cache.
-    #[clap(long, value_hint = ValueHint::DirPath, value_name = "PATH")]
+    #[arg(long, value_hint = ValueHint::DirPath, value_name = "PATH")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_path: Option<PathBuf>,
 
     /// The path to the library folder.
-    #[clap(long, value_hint = ValueHint::DirPath, value_name = "PATH")]
+    #[arg(long, value_hint = ValueHint::DirPath, value_name = "PATH")]
     #[serde(rename = "libs", skip_serializing_if = "Vec::is_empty")]
     pub lib_paths: Vec<PathBuf>,
 
     /// Use the Hardhat-style project layout.
     ///
     /// This is the same as using: `--contracts contracts --lib-paths node_modules`.
-    #[clap(long, conflicts_with = "contracts", visible_alias = "hh")]
+    #[arg(long, conflicts_with = "contracts", visible_alias = "hh")]
     #[serde(skip)]
     pub hardhat: bool,
 
     /// Path to the config file.
-    #[clap(long, value_hint = ValueHint::FilePath, value_name = "FILE")]
+    #[arg(long, value_hint = ValueHint::FilePath, value_name = "FILE")]
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
 }
 
-impl ProjectPathsArgs {
-    /// Returns the root directory to use for configuring the [Project]
+impl ProjectPathOpts {
+    /// Returns the root directory to use for configuring the project.
     ///
-    /// This will be the `--root` argument if provided, otherwise see [find_project_root_path()]
+    /// This will be the `--root` argument if provided, otherwise see [`find_project_root`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the project root directory cannot be found. See [`find_project_root`].
+    #[track_caller]
     pub fn project_root(&self) -> PathBuf {
-        self.root.clone().unwrap_or_else(|| find_project_root_path(None).unwrap())
+        self.root
+            .clone()
+            .unwrap_or_else(|| find_project_root(None).expect("could not determine project root"))
     }
 
     /// Returns the remappings to add to the config
@@ -83,10 +90,10 @@ impl ProjectPathsArgs {
     }
 }
 
-foundry_config::impl_figment_convert!(ProjectPathsArgs);
+foundry_config::impl_figment_convert!(ProjectPathOpts);
 
 // Make this args a `figment::Provider` so that it can be merged into the `Config`
-impl Provider for ProjectPathsArgs {
+impl Provider for ProjectPathOpts {
     fn metadata(&self) -> Metadata {
         Metadata::named("Project Paths Args Provider")
     }

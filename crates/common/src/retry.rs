@@ -1,19 +1,35 @@
 //! Retry utilities.
 
-use eyre::{Error, Result};
-use std::{future::Future, time::Duration};
+use eyre::{Error, Report, Result};
+use std::time::Duration;
+
+/// Error type for Retry.
+#[derive(Debug, thiserror::Error)]
+pub enum RetryError<E = Report> {
+    /// Continues operation without decrementing retries.
+    Continue(E),
+    /// Keeps retrying operation.
+    Retry(E),
+    /// Stops retrying operation immediately.
+    Break(E),
+}
 
 /// A type that keeps track of attempts.
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct Retry {
     retries: u32,
-    delay: Option<Duration>,
+    delay: Duration,
 }
 
 impl Retry {
     /// Creates a new `Retry` instance.
-    pub fn new(retries: u32, delay: Option<Duration>) -> Self {
+    pub fn new(retries: u32, delay: Duration) -> Self {
         Self { retries, delay }
+    }
+
+    /// Creates a new `Retry` instance with no delay between retries.
+    pub fn new_no_delay(retries: u32) -> Self {
+        Self::new(retries, Duration::ZERO)
     }
 
     /// Runs the given closure in a loop, retrying if it fails up to the specified number of times.
@@ -22,8 +38,8 @@ impl Retry {
             match callback() {
                 Err(e) if self.retries > 0 => {
                     self.handle_err(e);
-                    if let Some(delay) = self.delay {
-                        std::thread::sleep(delay);
+                    if !self.delay.is_zero() {
+                        std::thread::sleep(self.delay);
                     }
                 }
                 res => return res,
@@ -42,8 +58,8 @@ impl Retry {
             match callback().await {
                 Err(e) if self.retries > 0 => {
                     self.handle_err(e);
-                    if let Some(delay) = self.delay {
-                        tokio::time::sleep(delay).await;
+                    if !self.delay.is_zero() {
+                        tokio::time::sleep(self.delay).await;
                     }
                 }
                 res => return res,
@@ -51,8 +67,53 @@ impl Retry {
         }
     }
 
+    /// Runs the given async closure in a loop, retrying if it fails up to the specified number of
+    /// times or immediately returning an error if the closure returned [`RetryError::Break`].
+    pub async fn run_async_until_break<F, Fut, T>(mut self, mut callback: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, RetryError>>,
+    {
+        loop {
+            match callback().await {
+                Err(RetryError::Continue(e)) => {
+                    self.log(e, false);
+                    if !self.delay.is_zero() {
+                        tokio::time::sleep(self.delay).await;
+                    }
+                }
+                Err(RetryError::Retry(e)) if self.retries > 0 => {
+                    self.handle_err(e);
+                    if !self.delay.is_zero() {
+                        tokio::time::sleep(self.delay).await;
+                    }
+                }
+                Err(RetryError::Retry(e) | RetryError::Break(e)) => return Err(e),
+                Ok(t) => return Ok(t),
+            };
+        }
+    }
+
     fn handle_err(&mut self, err: Error) {
+        debug_assert!(self.retries > 0);
         self.retries -= 1;
-        warn!("erroneous attempt ({} tries remaining): {}", self.retries, err.root_cause());
+        self.log(err, true);
+    }
+
+    fn log(&self, err: Error, warn: bool) {
+        let msg = format!(
+            "{err}{delay} ({retries} tries remaining)",
+            delay = if self.delay.is_zero() {
+                String::new()
+            } else {
+                format!("; waiting {} seconds before trying again", self.delay.as_secs())
+            },
+            retries = self.retries,
+        );
+        if warn {
+            let _ = sh_warn!("{msg}");
+        } else {
+            tracing::info!("{msg}");
+        }
     }
 }

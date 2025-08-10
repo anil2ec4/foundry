@@ -1,144 +1,128 @@
 //! Forge test runner for multiple contracts.
 
 use crate::{
-    link::{link_with_nonce_or_address, PostLinkInput, ResolvedDependency},
-    result::SuiteResult,
-    ContractRunner, TestFilter, TestOptions,
+    ContractRunner, TestFilter, progress::TestsProgress, result::SuiteResult,
+    runner::LIBRARY_DEPLOYER,
 };
-use alloy_json_abi::{Function, JsonAbi as Abi};
+use alloy_json_abi::{Function, JsonAbi};
 use alloy_primitives::{Address, Bytes, U256};
 use eyre::Result;
-use foundry_common::{ContractsByArtifact, TestFunctionExt};
+use foundry_common::{ContractsByArtifact, TestFunctionExt, get_contract_name, shell::verbosity};
 use foundry_compilers::{
-    artifacts::CompactContractBytecode, contracts::ArtifactContracts, Artifact, ArtifactId,
-    ArtifactOutput, ProjectCompileOutput,
+    Artifact, ArtifactId, ProjectCompileOutput,
+    artifacts::{Contract, Libraries},
+    compilers::Compiler,
 };
+use foundry_config::{Config, InlineConfig};
 use foundry_evm::{
+    Env,
     backend::Backend,
+    decode::RevertDecoder,
     executors::{Executor, ExecutorBuilder},
     fork::CreateFork,
     inspectors::CheatsConfig,
     opts::EvmOpts,
-    revm,
+    traces::{InternalTraceMode, TraceMode},
 };
+use foundry_linking::{LinkOutput, Linker};
 use rayon::prelude::*;
-use revm::primitives::SpecId;
+use revm::primitives::hardfork::SpecId;
 use std::{
-    collections::{BTreeMap, HashSet},
-    iter::Iterator,
+    borrow::Borrow,
+    collections::BTreeMap,
+    fmt::Debug,
     path::Path,
-    sync::{mpsc::Sender, Arc},
+    sync::{Arc, mpsc},
+    time::Instant,
 };
 
-pub type DeployableContracts = BTreeMap<ArtifactId, (Abi, Bytes, Vec<Bytes>)>;
+#[derive(Debug, Clone)]
+pub struct TestContract {
+    pub abi: JsonAbi,
+    pub bytecode: Bytes,
+}
+
+pub type DeployableContracts = BTreeMap<ArtifactId, TestContract>;
 
 /// A multi contract runner receives a set of contracts deployed in an EVM instance and proceeds
 /// to run all test functions in these contracts.
 pub struct MultiContractRunner {
-    /// Mapping of contract name to Abi, creation bytecode and library bytecode which
+    /// Mapping of contract name to JsonAbi, creation bytecode and library bytecode which
     /// needs to be deployed & linked against
     pub contracts: DeployableContracts,
-    /// Compiled contracts by name that have an Abi and runtime bytecode
+    /// Known contracts linked with computed library addresses.
     pub known_contracts: ContractsByArtifact,
-    /// The EVM instance used in the test runner
-    pub evm_opts: EvmOpts,
-    /// The configured evm
-    pub env: revm::primitives::Env,
-    /// The EVM spec
-    pub evm_spec: SpecId,
-    /// All known errors, used for decoding reverts
-    pub errors: Option<Abi>,
-    /// The address which will be used as the `from` field in all EVM calls
-    pub sender: Option<Address>,
-    /// A map of contract names to absolute source file paths
-    pub source_paths: BTreeMap<String, String>,
+    /// Revert decoder. Contains all known errors and their selectors.
+    pub revert_decoder: RevertDecoder,
+    /// Libraries to deploy.
+    pub libs_to_deploy: Vec<Bytes>,
+    /// Library addresses used to link contracts.
+    pub libraries: Libraries,
+
     /// The fork to use at launch
     pub fork: Option<CreateFork>,
-    /// Additional cheatcode inspector related settings derived from the `Config`
-    pub cheats_config: Arc<CheatsConfig>,
-    /// Whether to collect coverage info
-    pub coverage: bool,
-    /// Whether to collect debug info
-    pub debug: bool,
-    /// Settings related to fuzz and/or invariant tests
-    pub test_options: TestOptions,
+
+    /// The base configuration for the test runner.
+    pub tcfg: TestRunnerConfig,
+}
+
+impl std::ops::Deref for MultiContractRunner {
+    type Target = TestRunnerConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tcfg
+    }
+}
+
+impl std::ops::DerefMut for MultiContractRunner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tcfg
+    }
 }
 
 impl MultiContractRunner {
-    /// Returns the number of matching tests
-    pub fn matching_test_function_count(&self, filter: &impl TestFilter) -> usize {
-        self.matching_test_functions(filter).count()
+    /// Returns an iterator over all contracts that match the filter.
+    pub fn matching_contracts<'a: 'b, 'b>(
+        &'a self,
+        filter: &'b dyn TestFilter,
+    ) -> impl Iterator<Item = (&'a ArtifactId, &'a TestContract)> + 'b {
+        self.contracts.iter().filter(|&(id, c)| matches_contract(id, &c.abi, filter))
     }
 
-    /// Returns all test functions matching the filter
-    pub fn get_matching_test_functions<'a>(
+    /// Returns an iterator over all test functions that match the filter.
+    pub fn matching_test_functions<'a: 'b, 'b>(
         &'a self,
-        filter: &'a impl TestFilter,
-    ) -> Vec<&Function> {
-        self.matching_test_functions(filter).collect()
+        filter: &'b dyn TestFilter,
+    ) -> impl Iterator<Item = &'a Function> + 'b {
+        self.matching_contracts(filter)
+            .flat_map(|(_, c)| c.abi.functions())
+            .filter(|func| is_matching_test(func, filter))
     }
 
-    /// Returns all test functions matching the filter
-    pub fn matching_test_functions<'a>(
+    /// Returns an iterator over all test functions in contracts that match the filter.
+    pub fn all_test_functions<'a: 'b, 'b>(
         &'a self,
-        filter: &'a impl TestFilter,
-    ) -> impl Iterator<Item = &Function> {
+        filter: &'b dyn TestFilter,
+    ) -> impl Iterator<Item = &'a Function> + 'b {
         self.contracts
             .iter()
-            .filter(|(id, _)| {
-                filter.matches_path(id.source.to_string_lossy()) &&
-                    filter.matches_contract(&id.name)
-            })
-            .flat_map(|(_, (abi, _, _))| {
-                abi.functions().filter(|func| filter.matches_test(func.signature()))
-            })
-    }
-
-    /// Get an iterator over all test contract functions that matches the filter path and contract
-    /// name
-    fn filtered_tests<'a>(
-        &'a self,
-        filter: &'a impl TestFilter,
-    ) -> impl Iterator<Item = &Function> {
-        self.contracts
-            .iter()
-            .filter(|(id, _)| {
-                filter.matches_path(id.source.to_string_lossy()) &&
-                    filter.matches_contract(&id.name)
-            })
-            .flat_map(|(_, (abi, _, _))| abi.functions())
-    }
-
-    /// Get all test names matching the filter
-    pub fn get_tests(&self, filter: &impl TestFilter) -> Vec<String> {
-        self.filtered_tests(filter)
-            .map(|func| func.name.clone())
-            .filter(|name| name.is_test())
-            .collect()
+            .filter(|(id, _)| filter.matches_path(&id.source) && filter.matches_contract(&id.name))
+            .flat_map(|(_, c)| c.abi.functions())
+            .filter(|func| func.is_any_test())
     }
 
     /// Returns all matching tests grouped by contract grouped by file (file -> (contract -> tests))
-    pub fn list(
-        &self,
-        filter: &impl TestFilter,
-    ) -> BTreeMap<String, BTreeMap<String, Vec<String>>> {
-        self.contracts
-            .iter()
-            .filter(|(id, _)| {
-                filter.matches_path(id.source.to_string_lossy()) &&
-                    filter.matches_contract(&id.name)
-            })
-            .filter(|(_, (abi, _, _))| abi.functions().any(|func| filter.matches_test(&func.name)))
-            .map(|(id, (abi, _, _))| {
+    pub fn list(&self, filter: &dyn TestFilter) -> BTreeMap<String, BTreeMap<String, Vec<String>>> {
+        self.matching_contracts(filter)
+            .map(|(id, c)| {
                 let source = id.source.as_path().display().to_string();
                 let name = id.name.clone();
-                let tests = abi
+                let tests = c
+                    .abi
                     .functions()
-                    .filter(|func| func.name.is_test())
-                    .filter(|func| filter.matches_test(func.signature()))
+                    .filter(|func| is_matching_test(func, filter))
                     .map(|func| func.name.clone())
                     .collect::<Vec<_>>();
-
                 (source, name, tests)
             })
             .fold(BTreeMap::new(), |mut acc, (source, name, tests)| {
@@ -147,95 +131,257 @@ impl MultiContractRunner {
             })
     }
 
-    /// Executes _all_ tests that match the given `filter`
+    /// Executes _all_ tests that match the given `filter`.
+    ///
+    /// The same as [`test`](Self::test), but returns the results instead of streaming them.
+    ///
+    /// Note that this method returns only when all tests have been executed.
+    pub fn test_collect(
+        &mut self,
+        filter: &dyn TestFilter,
+    ) -> Result<BTreeMap<String, SuiteResult>> {
+        Ok(self.test_iter(filter)?.collect())
+    }
+
+    /// Executes _all_ tests that match the given `filter`.
+    ///
+    /// The same as [`test`](Self::test), but returns the results instead of streaming them.
+    ///
+    /// Note that this method returns only when all tests have been executed.
+    pub fn test_iter(
+        &mut self,
+        filter: &dyn TestFilter,
+    ) -> Result<impl Iterator<Item = (String, SuiteResult)>> {
+        let (tx, rx) = mpsc::channel();
+        self.test(filter, tx, false)?;
+        Ok(rx.into_iter())
+    }
+
+    /// Executes _all_ tests that match the given `filter`.
     ///
     /// This will create the runtime based on the configured `evm` ops and create the `Backend`
     /// before executing all contracts and their tests in _parallel_.
     ///
     /// Each Executor gets its own instance of the `Backend`.
-    pub async fn test(
+    pub fn test(
         &mut self,
-        filter: impl TestFilter,
-        stream_result: Option<Sender<(String, SuiteResult)>>,
-        test_options: TestOptions,
-    ) -> BTreeMap<String, SuiteResult> {
+        filter: &dyn TestFilter,
+        tx: mpsc::Sender<(String, SuiteResult)>,
+        show_progress: bool,
+    ) -> Result<()> {
+        let tokio_handle = tokio::runtime::Handle::current();
         trace!("running all tests");
 
-        // the db backend that serves all the data, each contract gets its own instance
-        let db = Backend::spawn(self.fork.take()).await;
-        let filter = &filter;
+        // The DB backend that serves all the data.
+        let db = Backend::spawn(self.fork.take())?;
 
-        self.contracts
-            .par_iter()
-            .filter(|(id, _)| {
-                filter.matches_path(id.source.to_string_lossy()) &&
-                    filter.matches_contract(&id.name)
+        let find_timer = Instant::now();
+        let contracts = self.matching_contracts(filter).collect::<Vec<_>>();
+        let find_time = find_timer.elapsed();
+        debug!(
+            "Found {} test contracts out of {} in {:?}",
+            contracts.len(),
+            self.contracts.len(),
+            find_time,
+        );
+
+        if show_progress {
+            let tests_progress = TestsProgress::new(contracts.len(), rayon::current_num_threads());
+            // Collect test suite results to stream at the end of test run.
+            let results: Vec<(String, SuiteResult)> = contracts
+                .par_iter()
+                .map(|&(id, contract)| {
+                    let _guard = tokio_handle.enter();
+                    tests_progress.inner.lock().start_suite_progress(&id.identifier());
+
+                    let result = self.run_test_suite(
+                        id,
+                        contract,
+                        &db,
+                        filter,
+                        &tokio_handle,
+                        Some(&tests_progress),
+                    );
+
+                    tests_progress
+                        .inner
+                        .lock()
+                        .end_suite_progress(&id.identifier(), result.summary());
+
+                    (id.identifier(), result)
+                })
+                .collect();
+
+            tests_progress.inner.lock().clear();
+
+            results.iter().for_each(|result| {
+                let _ = tx.send(result.to_owned());
+            });
+        } else {
+            contracts.par_iter().for_each(|&(id, contract)| {
+                let _guard = tokio_handle.enter();
+                let result = self.run_test_suite(id, contract, &db, filter, &tokio_handle, None);
+                let _ = tx.send((id.identifier(), result));
             })
-            .filter(|(_, (abi, _, _))| abi.functions().any(|func| filter.matches_test(&func.name)))
-            .map_with(stream_result, |stream_result, (id, (abi, deploy_code, libs))| {
-                let executor = ExecutorBuilder::new()
-                    .inspectors(|stack| {
-                        stack
-                            .cheatcodes(self.cheats_config.clone())
-                            .trace(self.evm_opts.verbosity >= 3 || self.debug)
-                            .debug(self.debug)
-                            .coverage(self.coverage)
-                    })
-                    .spec(self.evm_spec)
-                    .gas_limit(self.evm_opts.gas_limit())
-                    .build(self.env.clone(), db.clone());
-                let identifier = id.identifier();
-                trace!(contract=%identifier, "start executing all tests in contract");
+        }
 
-                let result = self.run_tests(
-                    &identifier,
-                    abi,
-                    executor,
-                    deploy_code.clone(),
-                    libs,
-                    filter,
-                    test_options.clone(),
-                );
-                trace!(contract=?identifier, "executed all tests in contract");
-
-                if let Some(stream_result) = stream_result {
-                    let _ = stream_result.send((identifier.clone(), result.clone()));
-                }
-
-                (identifier, result)
-            })
-            .collect()
+        Ok(())
     }
 
-    #[instrument(skip_all, fields(name = %name))]
-    #[allow(clippy::too_many_arguments)]
-    fn run_tests(
+    fn run_test_suite(
         &self,
-        name: &str,
-        contract: &Abi,
-        executor: Executor,
-        deploy_code: Bytes,
-        libs: &[Bytes],
-        filter: impl TestFilter,
-        test_options: TestOptions,
+        artifact_id: &ArtifactId,
+        contract: &TestContract,
+        db: &Backend,
+        filter: &dyn TestFilter,
+        tokio_handle: &tokio::runtime::Handle,
+        progress: Option<&TestsProgress>,
     ) -> SuiteResult {
+        let identifier = artifact_id.identifier();
+        let mut span_name = identifier.as_str();
+
+        if !enabled!(tracing::Level::TRACE) {
+            span_name = get_contract_name(&identifier);
+        }
+        let span = debug_span!("suite", name = %span_name);
+        let span_local = span.clone();
+        let _guard = span_local.enter();
+
+        debug!("start executing all tests in contract");
+
+        let executor = self.tcfg.executor(self.known_contracts.clone(), artifact_id, db.clone());
         let runner = ContractRunner::new(
-            name,
-            executor,
+            &identifier,
             contract,
-            deploy_code,
-            self.evm_opts.initial_balance,
-            self.sender,
-            self.errors.as_ref(),
-            libs,
-            self.debug,
+            executor,
+            progress,
+            tokio_handle,
+            span,
+            self,
         );
-        runner.run_tests(filter, test_options, Some(&self.known_contracts))
+        let r = runner.run_tests(filter);
+
+        debug!(duration=?r.duration, "executed all tests in contract");
+
+        r
+    }
+}
+
+/// Configuration for the test runner.
+///
+/// This is modified after instantiation through inline config.
+#[derive(Clone)]
+pub struct TestRunnerConfig {
+    /// Project config.
+    pub config: Arc<Config>,
+    /// Inline configuration.
+    pub inline_config: Arc<InlineConfig>,
+
+    /// EVM configuration.
+    pub evm_opts: EvmOpts,
+    /// EVM environment.
+    pub env: Env,
+    /// EVM version.
+    pub spec_id: SpecId,
+    /// The address which will be used to deploy the initial contracts and send all transactions.
+    pub sender: Address,
+
+    /// Whether to collect line coverage info
+    pub line_coverage: bool,
+    /// Whether to collect debug info
+    pub debug: bool,
+    /// Whether to enable steps tracking in the tracer.
+    pub decode_internal: InternalTraceMode,
+    /// Whether to enable call isolation.
+    pub isolation: bool,
+    /// Whether to enable Odyssey features.
+    pub odyssey: bool,
+}
+
+impl TestRunnerConfig {
+    /// Reconfigures all fields using the given `config`.
+    /// This is for example used to override the configuration with inline config.
+    pub fn reconfigure_with(&mut self, config: Arc<Config>) {
+        debug_assert!(!Arc::ptr_eq(&self.config, &config));
+
+        self.spec_id = config.evm_spec_id();
+        self.sender = config.sender;
+        self.odyssey = config.odyssey;
+        self.isolation = config.isolate;
+
+        // Specific to Forge, not present in config.
+        // TODO: self.evm_opts
+        // TODO: self.env
+        // self.coverage = N/A;
+        // self.debug = N/A;
+        // self.decode_internal = N/A;
+
+        self.config = config;
+    }
+
+    /// Configures the given executor with this configuration.
+    pub fn configure_executor(&self, executor: &mut Executor) {
+        // TODO: See above
+
+        let inspector = executor.inspector_mut();
+        // inspector.set_env(&self.env);
+        if let Some(cheatcodes) = inspector.cheatcodes.as_mut() {
+            cheatcodes.config =
+                Arc::new(cheatcodes.config.clone_with(&self.config, self.evm_opts.clone()));
+        }
+        inspector.tracing(self.trace_mode());
+        inspector.collect_line_coverage(self.line_coverage);
+        inspector.enable_isolation(self.isolation);
+        inspector.odyssey(self.odyssey);
+        // inspector.set_create2_deployer(self.evm_opts.create2_deployer);
+
+        // executor.env_mut().clone_from(&self.env);
+        executor.set_spec_id(self.spec_id);
+        // executor.set_gas_limit(self.evm_opts.gas_limit());
+        executor.set_legacy_assertions(self.config.legacy_assertions);
+    }
+
+    /// Creates a new executor with this configuration.
+    pub fn executor(
+        &self,
+        known_contracts: ContractsByArtifact,
+        artifact_id: &ArtifactId,
+        db: Backend,
+    ) -> Executor {
+        let cheats_config = Arc::new(CheatsConfig::new(
+            &self.config,
+            self.evm_opts.clone(),
+            Some(known_contracts),
+            Some(artifact_id.clone()),
+        ));
+        ExecutorBuilder::new()
+            .inspectors(|stack| {
+                stack
+                    .cheatcodes(cheats_config)
+                    .trace_mode(self.trace_mode())
+                    .line_coverage(self.line_coverage)
+                    .enable_isolation(self.isolation)
+                    .odyssey(self.odyssey)
+                    .create2_deployer(self.evm_opts.create2_deployer)
+            })
+            .spec_id(self.spec_id)
+            .gas_limit(self.evm_opts.gas_limit())
+            .legacy_assertions(self.config.legacy_assertions)
+            .build(self.env.clone(), db)
+    }
+
+    fn trace_mode(&self) -> TraceMode {
+        TraceMode::default()
+            .with_debug(self.debug)
+            .with_decode_internal(self.decode_internal)
+            .with_verbosity(self.evm_opts.verbosity)
+            .with_state_changes(verbosity() > 4)
     }
 }
 
 /// Builder used for instantiating the multi-contract runner
-#[derive(Debug, Default, Clone)]
+#[derive(Clone, Debug)]
+#[must_use = "builders do nothing unless you call `build` on them"]
 pub struct MultiContractRunnerBuilder {
     /// The address which will be used to deploy the initial contracts and send all
     /// transactions
@@ -246,174 +392,169 @@ pub struct MultiContractRunnerBuilder {
     pub evm_spec: Option<SpecId>,
     /// The fork to use at launch
     pub fork: Option<CreateFork>,
-    /// Additional cheatcode inspector related settings derived from the `Config`
-    pub cheats_config: Option<CheatsConfig>,
-    /// Whether or not to collect coverage info
-    pub coverage: bool,
+    /// Project config.
+    pub config: Arc<Config>,
+    /// Whether or not to collect line coverage info
+    pub line_coverage: bool,
     /// Whether or not to collect debug info
     pub debug: bool,
-    /// Settings related to fuzz and/or invariant tests
-    pub test_options: Option<TestOptions>,
+    /// Whether to enable steps tracking in the tracer.
+    pub decode_internal: InternalTraceMode,
+    /// Whether to enable call isolation
+    pub isolation: bool,
+    /// Whether to enable Odyssey features.
+    pub odyssey: bool,
 }
 
 impl MultiContractRunnerBuilder {
-    /// Given an EVM, proceeds to return a runner which is able to execute all tests
-    /// against that evm
-    pub fn build<A>(
-        self,
-        root: impl AsRef<Path>,
-        output: ProjectCompileOutput<A>,
-        env: revm::primitives::Env,
-        evm_opts: EvmOpts,
-    ) -> Result<MultiContractRunner>
-    where
-        A: ArtifactOutput,
-    {
-        // This is just the contracts compiled, but we need to merge this with the read cached
-        // artifacts
-        let contracts = output
-            .with_stripped_file_prefixes(&root)
-            .into_artifacts()
-            .map(|(i, c)| (i, c.into_contract_bytecode()))
-            .collect::<Vec<(ArtifactId, CompactContractBytecode)>>();
-
-        let mut known_contracts = ContractsByArtifact::default();
-        let source_paths = contracts
-            .iter()
-            .map(|(i, _)| (i.identifier(), root.as_ref().join(&i.source).to_string_lossy().into()))
-            .collect::<BTreeMap<String, String>>();
-        // create a mapping of name => (abi, deployment code, Vec<library deployment code>)
-        let mut deployable_contracts = DeployableContracts::default();
-
-        fn unique_deps(deps: Vec<ResolvedDependency>) -> Vec<ResolvedDependency> {
-            let mut filtered = Vec::new();
-            let mut seen = HashSet::new();
-            for dep in deps {
-                if !seen.insert(dep.id.clone()) {
-                    continue
-                }
-                filtered.push(dep);
-            }
-
-            filtered
+    pub fn new(config: Arc<Config>) -> Self {
+        Self {
+            config,
+            sender: Default::default(),
+            initial_balance: Default::default(),
+            evm_spec: Default::default(),
+            fork: Default::default(),
+            line_coverage: Default::default(),
+            debug: Default::default(),
+            isolation: Default::default(),
+            decode_internal: Default::default(),
+            odyssey: Default::default(),
         }
-
-        link_with_nonce_or_address(
-            ArtifactContracts::from_iter(contracts),
-            &mut known_contracts,
-            Default::default(),
-            evm_opts.sender,
-            1,
-            &mut deployable_contracts,
-            |post_link_input| {
-                let PostLinkInput {
-                    contract,
-                    known_contracts,
-                    id,
-                    extra: deployable_contracts,
-                    dependencies,
-                } = post_link_input;
-                let dependencies = unique_deps(dependencies);
-
-                let abi = contract.abi.expect("We should have an abi by now");
-
-                // get bytes if deployable, else add to known contracts and return.
-                // interfaces and abstract contracts should be known to enable fuzzing of their ABI
-                // but they should not be deployable and their source code should be skipped by the
-                // debugger and linker.
-                let Some(bytecode) = contract.bytecode.and_then(|b| b.object.into_bytes()) else {
-                    known_contracts.insert(id.clone(), (abi.clone(), vec![]));
-                    return Ok(())
-                };
-
-                // if it's a test, add it to deployable contracts
-                if abi.constructor.as_ref().map(|c| c.inputs.is_empty()).unwrap_or(true) &&
-                    abi.functions()
-                        .any(|func| func.name.is_test() || func.name.is_invariant_test())
-                {
-                    deployable_contracts.insert(
-                        id.clone(),
-                        (
-                            abi.clone(),
-                            bytecode,
-                            dependencies.into_iter().map(|dep| dep.bytecode).collect::<Vec<_>>(),
-                        ),
-                    );
-                }
-
-                contract
-                    .deployed_bytecode
-                    .and_then(|d_bcode| d_bcode.bytecode)
-                    .and_then(|bcode| bcode.object.into_bytes())
-                    .and_then(|bytes| known_contracts.insert(id.clone(), (abi, bytes.to_vec())));
-                Ok(())
-            },
-            root,
-        )?;
-
-        let execution_info = known_contracts.flatten();
-        Ok(MultiContractRunner {
-            contracts: deployable_contracts,
-            known_contracts,
-            evm_opts,
-            env,
-            evm_spec: self.evm_spec.unwrap_or(SpecId::MERGE),
-            sender: self.sender,
-            errors: Some(execution_info.2),
-            source_paths,
-            fork: self.fork,
-            cheats_config: self.cheats_config.unwrap_or_default().into(),
-            coverage: self.coverage,
-            debug: self.debug,
-            test_options: self.test_options.unwrap_or_default(),
-        })
     }
 
-    #[must_use]
     pub fn sender(mut self, sender: Address) -> Self {
         self.sender = Some(sender);
         self
     }
 
-    #[must_use]
     pub fn initial_balance(mut self, initial_balance: U256) -> Self {
         self.initial_balance = initial_balance;
         self
     }
 
-    #[must_use]
     pub fn evm_spec(mut self, spec: SpecId) -> Self {
         self.evm_spec = Some(spec);
         self
     }
 
-    #[must_use]
     pub fn with_fork(mut self, fork: Option<CreateFork>) -> Self {
         self.fork = fork;
         self
     }
 
-    #[must_use]
-    pub fn with_cheats_config(mut self, cheats_config: CheatsConfig) -> Self {
-        self.cheats_config = Some(cheats_config);
-        self
-    }
-
-    #[must_use]
-    pub fn with_test_options(mut self, test_options: TestOptions) -> Self {
-        self.test_options = Some(test_options);
-        self
-    }
-
-    #[must_use]
     pub fn set_coverage(mut self, enable: bool) -> Self {
-        self.coverage = enable;
+        self.line_coverage = enable;
         self
     }
 
-    #[must_use]
     pub fn set_debug(mut self, enable: bool) -> Self {
         self.debug = enable;
         self
     }
+
+    pub fn set_decode_internal(mut self, mode: InternalTraceMode) -> Self {
+        self.decode_internal = mode;
+        self
+    }
+
+    pub fn enable_isolation(mut self, enable: bool) -> Self {
+        self.isolation = enable;
+        self
+    }
+
+    pub fn odyssey(mut self, enable: bool) -> Self {
+        self.odyssey = enable;
+        self
+    }
+
+    /// Given an EVM, proceeds to return a runner which is able to execute all tests
+    /// against that evm
+    pub fn build<C: Compiler<CompilerContract = Contract>>(
+        self,
+        root: &Path,
+        output: &ProjectCompileOutput,
+        env: Env,
+        evm_opts: EvmOpts,
+    ) -> Result<MultiContractRunner> {
+        let contracts = output
+            .artifact_ids()
+            .map(|(id, v)| (id.with_stripped_file_prefixes(root), v))
+            .collect();
+        let linker = Linker::new(root, contracts);
+
+        // Build revert decoder from ABIs of all artifacts.
+        let abis = linker
+            .contracts
+            .iter()
+            .filter_map(|(_, contract)| contract.abi.as_ref().map(|abi| abi.borrow()));
+        let revert_decoder = RevertDecoder::new().with_abis(abis);
+
+        let LinkOutput { libraries, libs_to_deploy } = linker.link_with_nonce_or_address(
+            Default::default(),
+            LIBRARY_DEPLOYER,
+            0,
+            linker.contracts.keys(),
+        )?;
+
+        let linked_contracts = linker.get_linked_artifacts(&libraries)?;
+
+        // Create a mapping of name => (abi, deployment code, Vec<library deployment code>)
+        let mut deployable_contracts = DeployableContracts::default();
+
+        for (id, contract) in linked_contracts.iter() {
+            let Some(abi) = &contract.abi else { continue };
+
+            // if it's a test, link it and add to deployable contracts
+            if abi.constructor.as_ref().map(|c| c.inputs.is_empty()).unwrap_or(true)
+                && abi.functions().any(|func| func.name.is_any_test())
+            {
+                let Some(bytecode) =
+                    contract.get_bytecode_bytes().map(|b| b.into_owned()).filter(|b| !b.is_empty())
+                else {
+                    continue;
+                };
+
+                deployable_contracts
+                    .insert(id.clone(), TestContract { abi: abi.clone(), bytecode });
+            }
+        }
+
+        let known_contracts = ContractsByArtifact::new(linked_contracts);
+
+        Ok(MultiContractRunner {
+            contracts: deployable_contracts,
+            revert_decoder,
+            known_contracts,
+            libs_to_deploy,
+            libraries,
+
+            fork: self.fork,
+
+            tcfg: TestRunnerConfig {
+                evm_opts,
+                env,
+                spec_id: self.evm_spec.unwrap_or_else(|| self.config.evm_spec_id()),
+                sender: self.sender.unwrap_or(self.config.sender),
+
+                line_coverage: self.line_coverage,
+                debug: self.debug,
+                decode_internal: self.decode_internal,
+                inline_config: Arc::new(InlineConfig::new_parsed(output, &self.config)?),
+                isolation: self.isolation,
+                odyssey: self.odyssey,
+
+                config: self.config,
+            },
+        })
+    }
+}
+
+pub fn matches_contract(id: &ArtifactId, abi: &JsonAbi, filter: &dyn TestFilter) -> bool {
+    (filter.matches_path(&id.source) && filter.matches_contract(&id.name))
+        && abi.functions().any(|func| is_matching_test(func, filter))
+}
+
+/// Returns `true` if the function is a test function that matches the given filter.
+pub(crate) fn is_matching_test(func: &Function, filter: &dyn TestFilter) -> bool {
+    func.is_any_test() && filter.matches_test(&func.signature())
 }

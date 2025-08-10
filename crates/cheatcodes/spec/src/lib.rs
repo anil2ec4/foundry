@@ -1,5 +1,7 @@
-#![doc = include_str!("../README.md")]
-#![warn(missing_docs, unreachable_pub, unused_crate_dependencies, rust_2018_idioms)]
+//! Cheatcode specification for Foundry.
+
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, fmt};
@@ -81,22 +83,32 @@ impl Cheatcodes<'static> {
                 Vm::Wallet::STRUCT.clone(),
                 Vm::FfiResult::STRUCT.clone(),
                 Vm::ChainInfo::STRUCT.clone(),
+                Vm::Chain::STRUCT.clone(),
                 Vm::AccountAccess::STRUCT.clone(),
                 Vm::StorageAccess::STRUCT.clone(),
+                Vm::Gas::STRUCT.clone(),
+                Vm::DebugStep::STRUCT.clone(),
+                Vm::BroadcastTxSummary::STRUCT.clone(),
+                Vm::SignedDelegation::STRUCT.clone(),
+                Vm::PotentialRevert::STRUCT.clone(),
+                Vm::AccessListItem::STRUCT.clone(),
             ]),
             enums: Cow::Owned(vec![
                 Vm::CallerMode::ENUM.clone(),
                 Vm::AccountAccessKind::ENUM.clone(),
+                Vm::ForgeContext::ENUM.clone(),
+                Vm::BroadcastTxType::ENUM.clone(),
             ]),
-            errors: Vm::VM_ERRORS.iter().map(|&x| x.clone()).collect(),
+            errors: Vm::VM_ERRORS.iter().copied().cloned().collect(),
             events: Cow::Borrowed(&[]),
-            // events: Vm::VM_EVENTS.iter().map(|&x| x.clone()).collect(),
-            cheatcodes: Vm::CHEATCODES.iter().map(|&x| x.clone()).collect(),
+            // events: Vm::VM_EVENTS.iter().copied().cloned().collect(),
+            cheatcodes: Vm::CHEATCODES.iter().copied().cloned().collect(),
         }
     }
 }
 
 #[cfg(test)]
+#[expect(clippy::disallowed_macros)]
 mod tests {
     use super::*;
     use std::{fs, path::Path};
@@ -120,14 +132,17 @@ mod tests {
     }
 
     fn sol_iface() -> String {
-        let cheats = Cheatcodes::new().to_string().trim().replace('\n', "\n    ");
+        let mut cheats = Cheatcodes::new();
+        cheats.errors = Default::default(); // Skip errors to allow <0.8.4.
+        let cheats = cheats.to_string().trim().replace('\n', "\n    ");
         format!(
             "\
 // Automatically generated from `foundry-cheatcodes` Vm definitions. Do not modify manually.
 // This interface is just for internal testing purposes. Use `forge-std` instead.
 
 // SPDX-License-Identifier: MIT OR Apache-2.0
-pragma solidity ^0.8.4;
+pragma solidity >=0.6.2 <0.9.0;
+pragma experimental ABIEncoderV2;
 
 interface Vm {{
     {cheats}
@@ -155,16 +170,16 @@ interface Vm {{
     /// Checks that the `file` has the specified `contents`. If that is not the
     /// case, updates the file and then fails the test.
     fn ensure_file_contents(file: &Path, contents: &str) {
-        if let Ok(old_contents) = fs::read_to_string(file) {
-            if normalize_newlines(&old_contents) == normalize_newlines(contents) {
-                // File is already up to date.
-                return
-            }
+        if let Ok(old_contents) = fs::read_to_string(file)
+            && normalize_newlines(&old_contents) == normalize_newlines(contents)
+        {
+            // File is already up to date.
+            return;
         }
 
         eprintln!("\n\x1b[31;1merror\x1b[0m: {} was not up-to-date, updating\n", file.display());
         if std::env::var("CI").is_ok() {
-            eprintln!("    NOTE: run `cargo test` locally and commit the updated files\n");
+            eprintln!("    NOTE: run `cargo cheats` locally and commit the updated files\n");
         }
         if let Some(parent) = file.parent() {
             let _ = fs::create_dir_all(parent);

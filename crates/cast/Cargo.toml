@@ -10,12 +10,15 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
+[lib]
+name = "cast"
+
 [[bin]]
 name = "cast"
 path = "bin/main.rs"
-
-[build-dependencies]
-vergen = { version = "8", default-features = false, features = ["build", "git", "git2"] }
 
 [dependencies]
 # lib
@@ -23,63 +26,77 @@ foundry-block-explorers.workspace = true
 foundry-common.workspace = true
 foundry-compilers.workspace = true
 foundry-config.workspace = true
+foundry-evm-core.workspace = true
 foundry-evm.workspace = true
+foundry-wallets.workspace = true
 
+alloy-chains.workspace = true
+alloy-consensus = { workspace = true, features = ["serde", "kzg"] }
+alloy-contract.workspace = true
 alloy-dyn-abi.workspace = true
 alloy-json-abi.workspace = true
+alloy-json-rpc.workspace = true
+alloy-network.workspace = true
 alloy-primitives.workspace = true
+alloy-provider = { workspace = true, features = [
+    "reqwest",
+    "ws",
+    "ipc",
+    "trace-api",
+    "txpool-api",
+] }
 alloy-rlp.workspace = true
+alloy-rpc-types = { workspace = true, features = ["eth", "trace"] }
+alloy-serde.workspace = true
+alloy-signer-local = { workspace = true, features = ["mnemonic", "keystore"] }
+alloy-signer.workspace = true
+alloy-sol-types.workspace = true
+alloy-transport.workspace = true
+alloy-ens = { workspace = true, features = ["provider"] }
+alloy-eips.workspace = true
 
-ethers-core.workspace = true
-ethers-providers.workspace = true
+op-alloy-flz.workspace = true
+op-alloy-consensus = { workspace = true, features = ["alloy-compat"] }
 
 chrono.workspace = true
-evm-disassembler = "0.3"
 eyre.workspace = true
-futures = "0.3"
-hex.workspace = true
+futures.workspace = true
+revm = { workspace = true, features = ["optional_balance_check"] }
 rand.workspace = true
-rayon = "1"
+rand_08.workspace = true
+rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true
-
-# aws
-rusoto_core = { version = "0.48", default-features = false }
-rusoto_kms = { version = "0.48", default-features = false }
 
 # bin
 foundry-cli.workspace = true
 
-ethers-contract.workspace = true
-ethers-middleware.workspace = true
-ethers-signers.workspace = true
-eth-keystore = "0.5"
-
 clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }
 clap_complete = "4"
 clap_complete_fig = "4"
-comfy-table = "7"
-dunce = "1"
-indicatif = "0.17"
+comfy-table.workspace = true
+dunce.workspace = true
 itertools.workspace = true
-regex = { version = "1", default-features = false }
+regex = { workspace = true, default-features = false }
 rpassword = "7"
-semver = "1"
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "signal"] }
+semver.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "signal"] }
 tracing.workspace = true
-yansi = "0.5"
+yansi.workspace = true
+evmole.workspace = true
 
 [dev-dependencies]
+anvil.workspace = true
 foundry-test-utils.workspace = true
-async-trait = "0.1"
-criterion = "0.5"
+alloy-hardforks.workspace = true
 
 [features]
-default = ["rustls"]
-rustls = ["foundry-cli/rustls"]
-openssl = ["foundry-cli/openssl"]
-
-[[bench]]
-name = "vanity"
-harness = false
+default = ["jemalloc"]
+asm-keccak = ["alloy-primitives/asm-keccak"]
+jemalloc = ["foundry-cli/jemalloc"]
+mimalloc = ["foundry-cli/mimalloc"]
+tracy-allocator = ["foundry-cli/tracy-allocator"]
+aws-kms = ["foundry-wallets/aws-kms"]
+gcp-kms = ["foundry-wallets/gcp-kms"]
+isolate-by-default = ["foundry-config/isolate-by-default"]

@@ -2,20 +2,23 @@
 //!
 //! EVM fuzzing implementation using [`proptest`].
 
-#![warn(unreachable_pub, unused_crate_dependencies, rust_2018_idioms)]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 #[macro_use]
 extern crate tracing;
 
 use alloy_dyn_abi::{DynSolValue, JsonAbiExt};
-use alloy_primitives::{Address, Bytes, U256};
-use ethers_core::types::Log;
-use foundry_common::{calc, contracts::ContractsByAddress};
+use alloy_primitives::{
+    Address, Bytes, Log,
+    map::{AddressHashMap, HashMap},
+};
+use foundry_common::{calc, contracts::ContractsByAddress, evm::Breakpoints};
 use foundry_evm_coverage::HitMaps;
-use foundry_evm_traces::CallTraceArena;
+use foundry_evm_traces::{CallTraceArena, SparsedTraceArena};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt};
+use std::{fmt, sync::Arc};
 
 pub use proptest::test_runner::{Config as FuzzConfig, Reason};
 
@@ -29,72 +32,130 @@ mod inspector;
 pub use inspector::Fuzzer;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[expect(clippy::large_enum_variant)]
 pub enum CounterExample {
     /// Call used as a counter example for fuzz tests.
     Single(BaseCounterExample),
-    /// Sequence of calls used as a counter example for invariant tests.
-    Sequence(Vec<BaseCounterExample>),
+    /// Original sequence size and sequence of calls used as a counter example for invariant tests.
+    Sequence(usize, Vec<BaseCounterExample>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BaseCounterExample {
-    /// Address which makes the call
+    /// Address which makes the call.
     pub sender: Option<Address>,
-    /// Address to which to call to
+    /// Address to which to call to.
     pub addr: Option<Address>,
-    /// The data to provide
+    /// The data to provide.
     pub calldata: Bytes,
-    /// Function signature if it exists
-    pub signature: Option<String>,
-    /// Contract name if it exists
+    /// Contract name if it exists.
     pub contract_name: Option<String>,
-    /// Traces
-    pub traces: Option<CallTraceArena>,
+    /// Function name if it exists.
+    pub func_name: Option<String>,
+    /// Function signature if it exists.
+    pub signature: Option<String>,
+    /// Pretty formatted args used to call the function.
+    pub args: Option<String>,
+    /// Unformatted args used to call the function.
+    pub raw_args: Option<String>,
+    /// Counter example traces.
     #[serde(skip)]
-    pub args: Vec<DynSolValue>,
+    pub traces: Option<SparsedTraceArena>,
+    /// Whether to display sequence as solidity.
+    #[serde(skip)]
+    pub show_solidity: bool,
 }
 
 impl BaseCounterExample {
-    pub fn create(
+    /// Creates counter example representing a step from invariant call sequence.
+    pub fn from_invariant_call(
         sender: Address,
         addr: Address,
         bytes: &Bytes,
         contracts: &ContractsByAddress,
-        traces: Option<CallTraceArena>,
+        traces: Option<SparsedTraceArena>,
+        show_solidity: bool,
     ) -> Self {
-        if let Some((name, abi)) = &contracts.get(&addr) {
-            if let Some(func) = abi.functions().find(|f| f.selector() == bytes[..4]) {
-                // skip the function selector when decoding
-                if let Ok(args) = func.abi_decode_input(&bytes[4..], false) {
-                    return BaseCounterExample {
-                        sender: Some(sender),
-                        addr: Some(addr),
-                        calldata: bytes.clone(),
-                        signature: Some(func.signature()),
-                        contract_name: Some(name.clone()),
-                        traces,
-                        args,
-                    }
-                }
+        if let Some((name, abi)) = &contracts.get(&addr)
+            && let Some(func) = abi.functions().find(|f| f.selector() == bytes[..4])
+        {
+            // skip the function selector when decoding
+            if let Ok(args) = func.abi_decode_input(&bytes[4..]) {
+                return Self {
+                    sender: Some(sender),
+                    addr: Some(addr),
+                    calldata: bytes.clone(),
+                    contract_name: Some(name.clone()),
+                    func_name: Some(func.name.clone()),
+                    signature: Some(func.signature()),
+                    args: Some(foundry_common::fmt::format_tokens(&args).format(", ").to_string()),
+                    raw_args: Some(
+                        foundry_common::fmt::format_tokens_raw(&args).format(", ").to_string(),
+                    ),
+                    traces,
+                    show_solidity,
+                };
             }
         }
 
-        BaseCounterExample {
+        Self {
             sender: Some(sender),
             addr: Some(addr),
             calldata: bytes.clone(),
-            signature: None,
             contract_name: None,
+            func_name: None,
+            signature: None,
+            args: None,
+            raw_args: None,
             traces,
-            args: vec![],
+            show_solidity: false,
+        }
+    }
+
+    /// Creates counter example for a fuzz test failure.
+    pub fn from_fuzz_call(
+        bytes: Bytes,
+        args: Vec<DynSolValue>,
+        traces: Option<SparsedTraceArena>,
+    ) -> Self {
+        Self {
+            sender: None,
+            addr: None,
+            calldata: bytes,
+            contract_name: None,
+            func_name: None,
+            signature: None,
+            args: Some(foundry_common::fmt::format_tokens(&args).format(", ").to_string()),
+            raw_args: Some(foundry_common::fmt::format_tokens_raw(&args).format(", ").to_string()),
+            traces,
+            show_solidity: false,
         }
     }
 }
 
 impl fmt::Display for BaseCounterExample {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Display counterexample as solidity.
+        if self.show_solidity
+            && let (Some(sender), Some(contract), Some(address), Some(func_name), Some(args)) =
+                (&self.sender, &self.contract_name, &self.addr, &self.func_name, &self.raw_args)
+        {
+            writeln!(f, "\t\tvm.prank({sender});")?;
+            write!(
+                f,
+                "\t\t{}({}).{}({});",
+                contract.split_once(':').map_or(contract.as_str(), |(_, contract)| contract),
+                address,
+                func_name,
+                args
+            )?;
+
+            return Ok(());
+        }
+
+        // Regular counterexample display.
         if let Some(sender) = self.sender {
-            write!(f, "sender={sender} addr=")?
+            write!(f, "\t\tsender={sender} addr=")?
         }
 
         if let Some(name) = &self.contract_name {
@@ -108,10 +169,14 @@ impl fmt::Display for BaseCounterExample {
         if let Some(sig) = &self.signature {
             write!(f, "calldata={sig}")?
         } else {
-            write!(f, "calldata={}", self.calldata)?
+            write!(f, "calldata={}", &self.calldata)?
         }
 
-        write!(f, " args=[{}]", foundry_common::fmt::format_tokens(&self.args).format(", "))
+        if let Some(args) = &self.args {
+            write!(f, " args=[{args}]")
+        } else {
+            write!(f, " args=[]")
+        }
     }
 }
 
@@ -126,6 +191,8 @@ pub struct FuzzTestResult {
     /// properly, or that there was a revert and that the test was expected to fail
     /// (prefixed with `testFail`)
     pub success: bool,
+    /// Whether the test case was skipped. `reason` will contain the skip reason, if any.
+    pub skipped: bool,
 
     /// If there was a revert, this field will be populated. Note that the test can
     /// still be successful (i.e self.success == true) when it's expected to fail.
@@ -138,37 +205,42 @@ pub struct FuzzTestResult {
     /// be printed to the user.
     pub logs: Vec<Log>,
 
-    /// The decoded DSTest logging events and Hardhat's `console.log` from [logs](Self::logs).
-    pub decoded_logs: Vec<String>,
-
     /// Labeled addresses
-    pub labeled_addresses: BTreeMap<Address, String>,
+    pub labels: AddressHashMap<String>,
 
     /// Exemplary traces for a fuzz run of the test function
     ///
     /// **Note** We only store a single trace of a successful fuzz call, otherwise we would get
     /// `num(fuzz_cases)` traces, one for each run, which is neither helpful nor performant.
-    pub traces: Option<CallTraceArena>,
+    pub traces: Option<SparsedTraceArena>,
 
-    /// Raw coverage info
-    pub coverage: Option<HitMaps>,
+    /// Additional traces used for gas report construction.
+    /// Those traces should not be displayed.
+    pub gas_report_traces: Vec<CallTraceArena>,
+
+    /// Raw line coverage info
+    pub line_coverage: Option<HitMaps>,
+
+    /// Breakpoints for debugger. Correspond to the same fuzz case as `traces`.
+    pub breakpoints: Option<Breakpoints>,
+
+    // Deprecated cheatcodes mapped to their replacements.
+    pub deprecated_cheatcodes: HashMap<&'static str, Option<&'static str>>,
 }
 
 impl FuzzTestResult {
     /// Returns the median gas of all test cases
     pub fn median_gas(&self, with_stipend: bool) -> u64 {
-        let mut values =
-            self.gas_values(with_stipend).into_iter().map(U256::from).collect::<Vec<_>>();
+        let mut values = self.gas_values(with_stipend);
         values.sort_unstable();
-        calc::median_sorted(&values).to::<u64>()
+        calc::median_sorted(&values)
     }
 
     /// Returns the average gas use of all test cases
     pub fn mean_gas(&self, with_stipend: bool) -> u64 {
-        let mut values =
-            self.gas_values(with_stipend).into_iter().map(U256::from).collect::<Vec<_>>();
+        let mut values = self.gas_values(with_stipend);
         values.sort_unstable();
-        calc::mean(&values).to::<u64>()
+        calc::mean(&values)
     }
 
     fn gas_values(&self, with_stipend: bool) -> Vec<u64> {
@@ -223,19 +295,17 @@ impl FuzzedCases {
     /// Returns the median gas of all test cases
     #[inline]
     pub fn median_gas(&self, with_stipend: bool) -> u64 {
-        let mut values =
-            self.gas_values(with_stipend).into_iter().map(U256::from).collect::<Vec<_>>();
+        let mut values = self.gas_values(with_stipend);
         values.sort_unstable();
-        calc::median_sorted(&values).to::<u64>()
+        calc::median_sorted(&values)
     }
 
     /// Returns the average gas use of all test cases
     #[inline]
     pub fn mean_gas(&self, with_stipend: bool) -> u64 {
-        let mut values =
-            self.gas_values(with_stipend).into_iter().map(U256::from).collect::<Vec<_>>();
+        let mut values = self.gas_values(with_stipend);
         values.sort_unstable();
-        calc::mean(&values).to::<u64>()
+        calc::mean(&values)
     }
 
     #[inline]
@@ -271,4 +341,41 @@ impl FuzzedCases {
     pub fn lowest_gas(&self) -> u64 {
         self.lowest().map(|c| c.gas).unwrap_or_default()
     }
+}
+
+/// Fixtures to be used for fuzz tests.
+///
+/// The key represents name of the fuzzed parameter, value holds possible fuzzed values.
+/// For example, for a fixture function declared as
+/// `function fixture_sender() external returns (address[] memory senders)`
+/// the fuzz fixtures will contain `sender` key with `senders` array as value
+#[derive(Clone, Default, Debug)]
+pub struct FuzzFixtures {
+    inner: Arc<HashMap<String, DynSolValue>>,
+}
+
+impl FuzzFixtures {
+    pub fn new(fixtures: HashMap<String, DynSolValue>) -> Self {
+        Self { inner: Arc::new(fixtures) }
+    }
+
+    /// Returns configured fixtures for `param_name` fuzzed parameter.
+    pub fn param_fixtures(&self, param_name: &str) -> Option<&[DynSolValue]> {
+        if let Some(param_fixtures) = self.inner.get(&normalize_fixture(param_name)) {
+            param_fixtures.as_fixed_array().or_else(|| param_fixtures.as_array())
+        } else {
+            None
+        }
+    }
+}
+
+/// Extracts fixture name from a function name.
+/// For example: fixtures defined in `fixture_Owner` function will be applied for `owner` parameter.
+pub fn fixture_name(function_name: String) -> String {
+    normalize_fixture(function_name.strip_prefix("fixture").unwrap())
+}
+
+/// Normalize fixture parameter name, for example `_Owner` to `owner`.
+fn normalize_fixture(param_name: &str) -> String {
+    param_name.trim_matches('_').to_ascii_lowercase()
 }

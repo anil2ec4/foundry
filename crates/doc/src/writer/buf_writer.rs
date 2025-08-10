@@ -1,25 +1,27 @@
-use crate::{writer::traits::ParamLike, AsDoc, CommentTag, Comments, Deployment, Markdown};
+use crate::{AsDoc, CommentTag, Comments, Deployment, Markdown, writer::traits::ParamLike};
 use itertools::Itertools;
-use once_cell::sync::Lazy;
 use solang_parser::pt::{ErrorParameter, EventParameter, Parameter, VariableDeclaration};
-use std::fmt::{self, Display, Write};
+use std::{
+    fmt::{self, Display, Write},
+    sync::LazyLock,
+};
 
 /// Solidity language name.
 const SOLIDITY: &str = "solidity";
 
 /// Headers and separator for rendering parameter table.
 const PARAM_TABLE_HEADERS: &[&str] = &["Name", "Type", "Description"];
-static PARAM_TABLE_SEPARATOR: Lazy<String> =
-    Lazy::new(|| PARAM_TABLE_HEADERS.iter().map(|h| "-".repeat(h.len())).join("|"));
+static PARAM_TABLE_SEPARATOR: LazyLock<String> =
+    LazyLock::new(|| PARAM_TABLE_HEADERS.iter().map(|h| "-".repeat(h.len())).join("|"));
 
 /// Headers and separator for rendering the deployments table.
 const DEPLOYMENTS_TABLE_HEADERS: &[&str] = &["Network", "Address"];
-static DEPLOYMENTS_TABLE_SEPARATOR: Lazy<String> =
-    Lazy::new(|| DEPLOYMENTS_TABLE_HEADERS.iter().map(|h| "-".repeat(h.len())).join("|"));
+static DEPLOYMENTS_TABLE_SEPARATOR: LazyLock<String> =
+    LazyLock::new(|| DEPLOYMENTS_TABLE_HEADERS.iter().map(|h| "-".repeat(h.len())).join("|"));
 
 /// The buffered writer.
 /// Writes various display items into the internal buffer.
-#[derive(Default, Debug)]
+#[derive(Debug, Default)]
 pub struct BufWriter {
     buf: String,
 }
@@ -41,7 +43,7 @@ impl BufWriter {
     }
 
     /// Write [AsDoc] implementation to the buffer with newline.
-    pub fn writeln_doc<T: AsDoc>(&mut self, doc: T) -> fmt::Result {
+    pub fn writeln_doc<T: AsDoc>(&mut self, doc: &T) -> fmt::Result {
         writeln!(self.buf, "{}", doc.as_doc()?)
     }
 
@@ -102,7 +104,7 @@ impl BufWriter {
         self.write_list_item(&link.as_doc()?, depth)
     }
 
-    /// Writes a solidity code block block to the buffer.
+    /// Writes a solidity code block to the buffer.
     pub fn write_code(&mut self, code: &str) -> fmt::Result {
         writeln!(self.buf, "{}", Markdown::CodeBlock(SOLIDITY, code))
     }
@@ -130,7 +132,7 @@ impl BufWriter {
 
         // There is nothing to write.
         if params.is_empty() || comments.is_empty() {
-            return Ok(())
+            return Ok(());
         }
 
         self.write_bold(heading)?;
